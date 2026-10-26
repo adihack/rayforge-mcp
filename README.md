@@ -79,20 +79,26 @@ and the text HELLO, cut at 80% / 400 mm/min, and show me the preview."*
 | Tool | What it does | Approval |
 |---|---|---|
 | `get_document` | Machine, layers, steps (power/speed/passes), workpieces (mm) | – |
-| `list_step_types`, `describe_step_settings` | Available operations; each setting with range/choices | – |
-| `import_svg`, `import_file` | Add SVG markup or a file (SVG/DXF/PDF/PNG…), optional x/y/size | – |
+| `list_step_types`, `describe_step_settings` | Available operations; each setting with range/choices/units | – |
+| `import_svg`, `import_file` | Add SVG markup or a file (SVG/DXF/PDF/PNG…), optional name, x/y/size | – |
 | `set_workpiece`, `remove_workpieces` | Move / resize / rotate / delete | – |
 | `add_layer`, `set_active_layer`, `add_step`, `remove_step` | Layer and workflow setup | – |
-| `set_step_settings` | e.g. `{"power": 0.6, "cut_speed": 800, "passes": 2}` | – |
+| `set_step_settings` | e.g. `{"power": 0.6, "cut_speed": 800, "passes": 2}`, one undo step per call | – |
 | `estimate_job` | Time, distances, bounding boxes, Rayforge sanity-check warnings | – |
 | `preview_toolpath` | PNG of the generated toolpath on the work area | – |
 | `get_gcode`, `save_project` | Machine code head / save to file; save `.ryp` | – |
-| `undo`, `redo` | Rayforge's undo stack | – |
+| `undo`, `redo` | Rayforge's undo stack; report what changed and what's next | – |
+| `machine_info` | Machine setup plus the controller's own settings (GRBL `$$`), with checks such as laser mode `$32` and max power `$30` | never |
 | `machine_status`, `machine_pause`, `machine_stop` | State/position/progress; feed hold; cancel | never |
 | `machine_start_job`, `machine_frame`, `machine_home`, `machine_jog`, `machine_resume`, `machine_clear_alarm` | Moves the head or fires the laser | **Allow in Rayforge** |
 
 Design edits use Rayforge's own undoable commands, so they show up live
 and `Ctrl+Z` works.
+
+A workpiece's `x`, `y`, `width` and `height` describe the geometry the
+laser follows. Rayforge pads imported SVGs with a small margin, so the
+X/Y fields in its UI show a slightly larger box; tools report that box
+as `frame`. Placing a 60×40 mm design at x=20 puts the cut at x=20.
 
 ## Safety model
 
@@ -121,9 +127,11 @@ and `Ctrl+Z` works.
   the version from the tag. To release, bump `VERSION` in
   `mcp_bridge/__init__.py` (shown to MCP clients), commit, then
   `git tag vX.Y.Z && git push origin vX.Y.Z`.
-- `dev/smoke_test.py` runs 22 MCP checks over HTTP against a running
-  Rayforge: design tools plus the safe refusals. Run it with an empty
-  document, no token, and no laser connected.
+- `dev/smoke_test.py` runs MCP checks over HTTP against a running
+  Rayforge: design tools plus the safe refusals. It edits the document,
+  so it refuses to run unless the document is empty. Point it at a
+  test instance (separate `--config` and port), never at your working
+  Rayforge. It needs no token and no laser connected.
 - `RAYFORGE_MCP_DEMO=1` treats Rayforge's "no device" placeholder driver
   as a machine, so you can try the approval dialogs without hardware.
 
@@ -140,16 +148,40 @@ headless:
   installer: version taken from the `v0.2.0` tag; the menu toggle,
   settings page and server all work without a restart. After uninstall,
   the next request gets 503 and the server shuts down.
-- **Design tools (22 smoke checks):** G-code carried the set power and
-  speed, and passes scaled cut length exactly.
+- **Design tools (smoke test):** G-code carried the set power and speed;
+  passes scaled cut length exactly; imported geometry lands exactly at
+  the requested x/y and size; one undo reverts a whole settings call.
 - **Machine flow** against a fake GRBL 1.1 controller (Rayforge's
   GRBL-telnet driver). A denied job streamed nothing. An approved job
   streamed `M4 S350`. Pause/resume/stop sent `!`/`~`/soft reset, then
   `M5`. Jog sent `$J=…` and home sent `$H`. A timed-out request sent
   nothing, and stop/status answered instantly while a dialog was open.
+  `machine_info` flagged `$32=0` and a `$30` mismatch, and reported no
+  checks for a correctly configured controller.
+- **Snap Rayforge 1.13.1** (strict confinement): installed with Install
+  from URL and used for a design-only session from Claude Code.
 
-**Not tested yet:** a real laser, Windows/macOS, Snap/Flatpak builds,
-raster-image imports.
+**Not tested yet:** a real laser, Windows/macOS, Flatpak, raster-image
+imports.
+
+## Changelog
+
+- **0.3.0**
+  - New read-only `machine_info` tool: machine setup plus the
+    controller's settings, with checks for GRBL laser mode (`$32`), max
+    power (`$30`) and travel (`$130`/`$131`).
+  - Positions and sizes now refer to the cut geometry, compensating for
+    Rayforge's SVG import margin. Resizing or rotating keeps the
+    geometry's corner in place unless x/y are given.
+  - `import_svg` uses the `name` argument as the workpiece name.
+  - `set_step_settings` is one undo step per call; `undo`/`redo` report
+    what they changed and what comes next.
+  - `describe_step_settings` describes power as a 0–1 fraction and gives
+    speed units and the machine's limits.
+  - Machines with no driver no longer show as connected; G-code line
+    counts match between `estimate_job` and `get_gcode`.
+  - The smoke test refuses to run against a document that has content.
+- **0.2.0**: first release.
 
 ## Known limitations
 

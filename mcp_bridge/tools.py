@@ -270,18 +270,52 @@ def describe_step(step, index):
     }
 
 
+def to_machine_rect(bbox):
+    """(min_x, min_y, max_x, max_y) in world mm -> machine (x, y, w, h)."""
+    min_x, min_y, max_x, max_y = bbox
+    width, height = max_x - min_x, max_y - min_y
+    m = machine()
+    if m is None:
+        return min_x, min_y, width, height
+    x, y = m.panel.world_item_to_machine((min_x, min_y), (width, height))
+    return x, y, width, height
+
+
+def item_rects(item):
+    """
+    Machine-coordinate rects of the cut geometry and of the item's frame.
+
+    Rayforge pads imported SVGs by a small margin, so the frame (what the
+    X/Y fields in Rayforge show) is slightly larger than the geometry the
+    laser follows. Items without vector geometry use the frame for both.
+    """
+    frame = editor().transform.group_bbox_world([item])
+    geometry = None
+    if hasattr(item, "get_world_geometry"):
+        geometry = item.get_world_geometry()
+    if geometry is not None and not geometry.is_empty():
+        content = geometry.rect()
+    else:
+        content = frame
+    return to_machine_rect(content), to_machine_rect(frame)
+
+
 def describe_workpiece(wp):
-    transform = editor().transform
-    pos = transform.get_position_group([wp]) or (None, None)
-    size = transform.get_size_group([wp]) or (None, None)
+    (x, y, w, h), (fx, fy, fw, fh) = item_rects(wp)
     return {
         "uid": wp.uid,
         "name": wp.name,
-        "x": rnd(pos[0]),
-        "y": rnd(pos[1]),
-        "width": rnd(size[0]),
-        "height": rnd(size[1]),
+        "x": rnd(x),
+        "y": rnd(y),
+        "width": rnd(w),
+        "height": rnd(h),
         "angle": rnd(wp.angle),
+        "frame": {
+            "x": rnd(fx),
+            "y": rnd(fy),
+            "width": rnd(fw),
+            "height": rnd(fh),
+        },
     }
 
 
@@ -293,7 +327,8 @@ def describe_machine(m):
         "name": m.name,
         "driver": m.driver_name,
         "work_area_mm": [rnd(width), rnd(height)],
-        "connected": m.is_connected(),
+        "connected": m.is_connected()
+        and not isinstance(m.driver, NoDeviceDriver),
         "max_cut_speed": m.max_cut_speed,
         "max_travel_speed": m.max_travel_speed,
     }
@@ -374,27 +409,38 @@ def coerce_setting(var, key, value):
 
 
 def apply_placement(items, args):
-    """Resize, rotate and move items per the optional tool arguments."""
+    """
+    Resize, rotate and move items per the optional tool arguments.
+    Sizes and positions refer to the cut geometry, not the padded frame.
+    """
     transform = editor().transform
-    if args.get("width") is not None or args.get("height") is not None:
-        transform.set_size(
-            items,
-            width=args.get("width"),
-            height=args.get("height"),
-            fixed_ratio=args.get("keep_aspect", True),
-        )
-    if args.get("angle") is not None:
-        transform.set_angle(items, float(args["angle"]))
-    if args.get("x") is not None or args.get("y") is not None:
-        for item in items:
-            cur_x, cur_y = transform.get_position_group([item])
-            x = args.get("x")
-            y = args.get("y")
-            transform.set_position(
-                [item],
-                cur_x if x is None else float(x),
-                cur_y if y is None else float(y),
-            )
+    width = args.get("width")
+    height = args.get("height")
+    x = args.get("x")
+    y = args.get("y")
+    keep_aspect = args.get("keep_aspect", True)
+    resizing = width is not None or height is not None
+    turning = args.get("angle") is not None
+    for item in items:
+        # Rayforge resizes and rotates around the centre; keep the
+        # geometry's corner where it was unless x/y are given.
+        (start_x, start_y, cw, ch), (_fx, _fy, fw, fh) = item_rects(item)
+        if resizing:
+            sx = float(width) / cw if width is not None and cw > 0 else None
+            sy = float(height) / ch if height is not None and ch > 0 else None
+            if keep_aspect:
+                sx = sy = sx if sx is not None else sy
+            sx = 1.0 if sx is None else sx
+            sy = 1.0 if sy is None else sy
+            transform.set_size([item], width=fw * sx, height=fh * sy)
+        if turning:
+            transform.set_angle([item], float(args["angle"]))
+        if x is not None or y is not None or resizing or turning:
+            (cx, cy, _w, _h), (fx, fy, _fw, _fh) = item_rects(item)
+            tx = start_x if x is None else float(x)
+            ty = start_y if y is None else float(y)
+            if abs(tx - cx) > 1e-6 or abs(ty - cy) > 1e-6:
+                transform.set_position([item], fx + tx - cx, fy + ty - cy)
 
 
 # ---------------------------------------------------------------------
@@ -458,7 +504,7 @@ def job_summary(job):
         else:
             summary[key] = rnd(value, 1)
     gcode = job.get("gcode")
-    summary["gcode_lines"] = gcode.count("\n") + 1 if gcode else 0
+    summary["gcode_lines"] = len(gcode.splitlines()) if gcode else 0
     return summary
 
 
@@ -887,6 +933,11 @@ def t_describe_step_settings(args):
         layer = find_layer(args.get("layer"))
         step = find_step(layer, args.get("step"))
         current = step_settings(step)
+        m = machine()
+        speed_limits = {
+            "cut_speed": m.max_cut_speed if m else None,
+            "travel_speed": m.max_travel_speed if m else None,
+        }
         settings = []
         for var in type(step).recipe_varset():
             entry = {
@@ -899,6 +950,14 @@ def t_describe_step_settings(args):
             for attr in ("min_val", "max_val"):
                 if getattr(var, attr, None) is not None:
                     entry[attr.replace("_val", "")] = getattr(var, attr)
+            if var.key == "power":
+                entry["description"] = (
+                    "Laser power as a fraction 0.0-1.0 (0.8 = 80 %)"
+                )
+            if var.key in speed_limits:
+                entry["unit"] = "mm/min"
+                if speed_limits[var.key]:
+                    entry["machine_max"] = speed_limits[var.key]
             labels = getattr(var, "_value_to_label", None)
             if labels:
                 entry["choices"] = {
@@ -927,8 +986,8 @@ def t_describe_step_settings(args):
 @tool(
     "set_step_settings",
     'Change settings of a step, e.g. {"power": 0.6, "cut_speed": 800, '
-    '"passes": 2}. power is a fraction 0.0-1.0; speeds are mm/min. Each '
-    "change is undoable.",
+    '"passes": 2}. power is a fraction 0.0-1.0; speeds are mm/min. One '
+    "call is one undo step.",
     {
         "layer": LAYER_ARG,
         "step": STEP_ARG,
@@ -972,28 +1031,31 @@ def t_set_step_settings(args):
 
         history = editor().history_manager
         on_transformer_change = step.per_step_transformer_changed.send
-        for key, target, payload in planned:
-            if key != "passes":
-                new_value, old_value = payload
-                history.execute(
-                    RecipeValueCommand(target, key, new_value, old_value)
-                )
-                continue
-            if payload > 1 and target.get("enabled") is False:
+        label = f"MCP: set {', '.join(settings)} on {step.name}"
+        # One call is one undo step, however many settings it changes.
+        with history.transaction(label):
+            for key, target, payload in planned:
+                if key != "passes":
+                    new_value, old_value = payload
+                    history.execute(
+                        RecipeValueCommand(target, key, new_value, old_value)
+                    )
+                    continue
+                if payload > 1 and target.get("enabled") is False:
+                    editor().step.set_step_param(
+                        target_dict=target,
+                        key="enabled",
+                        new_value=True,
+                        name="MCP: enable passes",
+                        on_change_callback=on_transformer_change,
+                    )
                 editor().step.set_step_param(
                     target_dict=target,
-                    key="enabled",
-                    new_value=True,
-                    name="MCP: enable passes",
+                    key="passes",
+                    new_value=payload,
+                    name="MCP: change number of passes",
                     on_change_callback=on_transformer_change,
                 )
-            editor().step.set_step_param(
-                target_dict=target,
-                key="passes",
-                new_value=payload,
-                name="MCP: change number of passes",
-                on_change_callback=on_transformer_change,
-            )
         return describe_step(step, layer_steps(layer).index(step))
 
     result = on_main(run)
@@ -1153,10 +1215,10 @@ def import_path(path, mime_type, args, timeout=60.0):
 
 
 PLACEMENT_ARGS = {
-    "x": {"type": "number", "description": "Target X in mm (optional)."},
-    "y": {"type": "number", "description": "Target Y in mm (optional)."},
-    "width": {"type": "number", "description": "Resize to width mm."},
-    "height": {"type": "number", "description": "Resize to height mm."},
+    "x": {"type": "number", "description": "X of the cut geometry, mm."},
+    "y": {"type": "number", "description": "Y of the cut geometry, mm."},
+    "width": {"type": "number", "description": "Cut geometry width, mm."},
+    "height": {"type": "number", "description": "Cut geometry height, mm."},
     "keep_aspect": {"type": "boolean", "default": True},
     "layer": LAYER_ARG,
 }
@@ -1180,11 +1242,27 @@ def t_import_svg(args):
         raise ToolError("'svg' must contain an <svg> element.")
     if len(svg.encode("utf-8")) > MAX_SVG_BYTES:
         raise ToolError("SVG is larger than 5 MB.")
-    name = re.sub(r"[^A-Za-z0-9_.-]+", "_", args.get("name") or "mcp-import")
-    IMPORT_DIR.mkdir(parents=True, exist_ok=True)
-    path = IMPORT_DIR / f"{name}-{int(time.time() * 1000)}.svg"
+    # Rayforge names the workpiece after the file, so write <name>.svg
+    # into a folder of its own instead of renaming afterwards (which
+    # would add an extra undo step).
+    name = (args.get("name") or "").strip() or "SVG import"
+    stem = re.sub(r"[\x00-\x1f/\\:*?\"<>|]+", "_", name)[:80].strip(" .")
+    folder = IMPORT_DIR / str(time.time_ns())
+    folder.mkdir(parents=True, exist_ok=True)
+    path = folder / f"{stem or 'import'}.svg"
     path.write_text(svg, encoding="utf-8")
-    return import_path(path, "image/svg+xml", args)
+    result = import_path(path, "image/svg+xml", args)
+    if args.get("name") and len(result["imported"]) == 1:
+        item = result["imported"][0]
+        if item["name"] != name:
+
+            def rename():
+                (wp,) = find_workpieces([item["uid"]])
+                editor().edit.rename_item(wp, name)
+
+            on_main(rename)
+            item["name"] = name
+    return result
 
 
 @tool(
@@ -1207,8 +1285,8 @@ def t_import_file(args):
 
 @tool(
     "set_workpiece",
-    "Move, resize or rotate workpieces. Position is the X/Y shown in "
-    "Rayforge (mm). Only the given fields change.",
+    "Move, resize or rotate workpieces. x/y/width/height refer to the cut "
+    "geometry in mm (see get_document). Only the given fields change.",
     {
         "workpieces": WORKPIECES_ARG,
         "x": NUMBER,
@@ -1247,26 +1325,53 @@ def t_remove_workpieces(args):
     return on_main(run)
 
 
-@tool("undo", "Undo the last change in Rayforge.")
+def command_label(command):
+    if command is None:
+        return None
+    return str(command.name or type(command).__name__)
+
+
+def history_state(history):
+    return {
+        "next_undo": command_label(
+            history.undo_stack[-1] if history.undo_stack else None
+        ),
+        "next_redo": command_label(
+            history.redo_stack[-1] if history.redo_stack else None
+        ),
+    }
+
+
+@tool(
+    "undo",
+    "Undo the last change in Rayforge. Returns what was undone and what "
+    "the next undo/redo would be.",
+)
 def t_undo(args):
     def run():
         history = editor().history_manager
         if not history.can_undo():
             raise ToolError("Nothing to undo.")
+        undone = command_label(history.undo_stack[-1])
         history.undo()
-        return {"can_undo": history.can_undo(), "can_redo": history.can_redo()}
+        return {"undone": undone, **history_state(history)}
 
     return on_main(run)
 
 
-@tool("redo", "Redo the last undone change in Rayforge.")
+@tool(
+    "redo",
+    "Redo the last undone change in Rayforge. Returns what was redone and "
+    "what the next undo/redo would be.",
+)
 def t_redo(args):
     def run():
         history = editor().history_manager
         if not history.can_redo():
             raise ToolError("Nothing to redo.")
+        redone = command_label(history.redo_stack[-1])
         history.redo()
-        return {"can_undo": history.can_undo(), "can_redo": history.can_redo()}
+        return {"redone": redone, **history_state(history)}
 
     return on_main(run)
 
@@ -1391,6 +1496,185 @@ def t_machine_status(args):
         }
 
     return on_main(run)
+
+
+SECRET_HINTS = ("pass", "token", "secret", "key")
+
+
+def read_firmware_settings(m, timeout=20.0):
+    """
+    Ask the controller for its settings through Rayforge's own reader
+    ($$ on GRBL; a read-only query). Returns {key: value}.
+    """
+    done = threading.Event()
+    box = {}
+
+    def on_updated(_sender, var_sets=None, **_kwargs):
+        box["var_sets"] = var_sets or []
+        done.set()
+
+    def on_error(_sender, error=None, **_kwargs):
+        box["error"] = error
+        done.set()
+
+    def start():
+        m.settings_updated.connect(on_updated, weak=False)
+        m.settings_error.connect(on_error, weak=False)
+        editor().task_manager.add_coroutine(
+            lambda ctx: m.controller.read_settings(),
+            key="mcp-read-firmware-settings",
+        )
+
+    def stop_listening():
+        m.settings_updated.disconnect(on_updated)
+        m.settings_error.disconnect(on_error)
+
+    on_main(start)
+    try:
+        if not done.wait(timeout):
+            raise ToolError("The controller did not answer within 20 s.")
+    finally:
+        on_main(stop_listening)
+    if "error" in box:
+        raise ToolError(f"Could not read controller settings: {box['error']}")
+    return {
+        var.key: var.value for var_set in box["var_sets"] for var in var_set
+    }
+
+
+def as_number(value):
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def grbl_checks(firmware, m):
+    """Compare GRBL settings with Rayforge's machine setup."""
+    checks = []
+    laser_mode = as_number(firmware.get("32"))
+    if laser_mode is not None and laser_mode != 1:
+        checks.append(
+            {
+                "level": "error",
+                "message": "$32 laser mode is off. GRBL then keeps the "
+                "laser on during moves and stops at every power change. "
+                "Enable laser mode on the controller before burning.",
+            }
+        )
+    s_max = as_number(firmware.get("30"))
+    for head in m.heads:
+        head_max = getattr(head, "max_power", None)
+        if not s_max or not head_max or abs(s_max - head_max) <= 0.5:
+            continue
+        if s_max < head_max:
+            effect = (
+                f"GRBL clamps at {s_max:g}, so anything above "
+                f"{s_max / head_max:.0%} in Rayforge is already FULL "
+                "power."
+            )
+        else:
+            effect = (
+                f"100 % in Rayforge only reaches {head_max / s_max:.0%} "
+                "of the laser's power."
+            )
+        checks.append(
+            {
+                "level": "warning",
+                "message": f"$30 (max S value) is {s_max:g} but head "
+                f"{head.name!r} has max power {head_max}. {effect} Set "
+                "the head's max power to match $30.",
+            }
+        )
+    for key, extent, axis in (
+        ("130", m.axis_extents[0], "X"),
+        ("131", m.axis_extents[1], "Y"),
+    ):
+        travel = as_number(firmware.get(key))
+        if travel and abs(travel - extent) > 1.0:
+            checks.append(
+                {
+                    "level": "warning",
+                    "message": f"${key} ({axis} max travel) is {travel:g} mm "
+                    f"but Rayforge's work area is {extent:g} mm.",
+                }
+            )
+    return checks
+
+
+@tool(
+    "machine_info",
+    "Read-only: the machine as configured in Rayforge (driver, connection, "
+    "work area, origin, speeds, laser heads, G-code dialect) and, when "
+    "connected and idle, the controller's own settings ($$ on GRBL) with "
+    "checks such as laser mode ($32) and max power ($30).",
+    {
+        "read_controller": {
+            "type": "boolean",
+            "default": True,
+            "description": "Also query the controller's settings.",
+        }
+    },
+    read_only=True,
+)
+def t_machine_info(args):
+    def describe():
+        m = machine()
+        if m is None:
+            raise ToolError("No machine is configured in Rayforge.")
+        driver_args = {
+            k: ("<hidden>" if any(h in k.lower() for h in SECRET_HINTS) else v)
+            for k, v in (m.driver_args or {}).items()
+        }
+        dialect = m.dialect
+        origin = "{}_{}".format(
+            "top" if m.y_axis_down else "bottom",
+            "right" if m.x_axis_right else "left",
+        )
+        heads = [
+            {
+                "name": head.name,
+                "type": type(head).__name__,
+                "max_power_s_value": getattr(head, "max_power", None),
+                "optical_power_w": getattr(head, "max_power_watts", None),
+                "wavelength_nm": getattr(head, "wavelength_nm", None),
+                "frame_power": getattr(head, "frame_power_percent", None),
+                "focus_power": getattr(head, "focus_power_percent", None),
+            }
+            for head in m.heads
+        ]
+        info = {
+            **describe_machine(m),
+            "connection": m.connection_status,
+            "driver_args": driver_args,
+            "dialect": getattr(dialect, "label", None),
+            "laser_on_command": getattr(dialect, "laser_on", None),
+            "origin": origin,
+            "acceleration": getattr(m, "acceleration", None),
+            "heads": heads,
+        }
+        can_read = (
+            m.is_connected()
+            and not isinstance(m.driver, NoDeviceDriver)
+            and not win.machine_cmd.is_job_running
+        )
+        return m, info, can_read
+
+    m, info, can_read = on_main(describe)
+    if not args.get("read_controller", True):
+        return info
+    if not can_read:
+        info["controller_settings"] = None
+        info["controller_note"] = (
+            "Not read: the machine must be connected, have a real driver "
+            "and not be running a job."
+        )
+        return info
+    firmware = read_firmware_settings(m)
+    info["controller_settings"] = {f"${k}": v for k, v in firmware.items()}
+    if "Grbl" in (info.get("driver") or ""):
+        info["checks"] = on_main(lambda: grbl_checks(firmware, m))
+    return info
 
 
 @tool(

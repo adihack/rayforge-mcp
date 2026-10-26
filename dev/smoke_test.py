@@ -2,7 +2,8 @@
 Smoke test for the Rayforge MCP bridge: talks MCP over HTTP like a
 client would and exercises the design tools. Machine tools are only
 checked for their safe refusals, so run it with no laser connected.
-It edits the open document, so use an empty one.
+It edits the open document, so it refuses to run unless that document
+is empty.
 
     python3 dev/smoke_test.py [http://127.0.0.1:8765/mcp] [preview.png]
 
@@ -98,6 +99,13 @@ tools = [t["name"] for t in rpc("tools/list")["tools"]]
 check("tools/list", "import_svg" in tools, f"{len(tools)} tools")
 
 err, docinfo, _, _ = call("get_document")
+existing = sum(len(layer["workpieces"]) for layer in docinfo["layers"])
+if existing:
+    sys.exit(
+        f"Refusing to run: the document at {URL} already has {existing} "
+        "workpiece(s), and this test edits it. Open an empty document "
+        "(or use a test instance on another port) and try again."
+    )
 check(
     "get_document",
     not err and docinfo["layers"],
@@ -115,17 +123,28 @@ print(
 err, types, _, _ = call("list_step_types")
 check("list_step_types", not err and types, [t["type"] for t in types][:6])
 
+
+def close(a, b, tol=0.05):
+    return a is not None and abs(a - b) < tol
+
+
+# The design's cut geometry spans x 2..58, y 2..38 (56 x 36 mm).
 err, imp, texts, _ = call(
-    "import_svg", svg=SVG, name="smoke", x=20, y=30, layer=0
+    "import_svg", svg=SVG, name="Smoke tag", x=20, y=30, layer=0
 )
 check("import_svg", not err and imp["imported"], texts[0][:300])
 wp = imp["imported"][0] if not err else None
 if wp:
     check(
-        "import placed at x=20,y=30",
-        abs(wp["x"] - 20) < 0.01 and abs(wp["y"] - 30) < 0.01,
-        f"x={wp['x']} y={wp['y']} {wp['width']}x{wp['height']}",
+        "import: cut geometry at x=20,y=30, 56x36 mm",
+        close(wp["x"], 20)
+        and close(wp["y"], 30)
+        and close(wp["width"], 56)
+        and close(wp["height"], 36),
+        f"x={wp['x']} y={wp['y']} {wp['width']}x{wp['height']}, "
+        f"frame {wp['frame']}",
     )
+    check("import uses the name argument", wp["name"] == "Smoke tag")
 
 err, settings, texts, _ = call("describe_step_settings", layer=0, step=0)
 check(
@@ -133,6 +152,14 @@ check(
     not err,
     [s["key"] for s in settings["settings"]] if not err else texts,
 )
+if not err:
+    by_key = {s["key"]: s for s in settings["settings"]}
+    check(
+        "power described as a fraction, speeds in mm/min",
+        "fraction" in by_key["power"]["description"]
+        and by_key["cut_speed"].get("unit") == "mm/min",
+    )
+    before = {k: by_key[k]["value"] for k in ("power", "cut_speed", "passes")}
 
 err, step, texts, _ = call(
     "set_step_settings",
@@ -147,6 +174,34 @@ check(
     and step["settings"]["cut_speed"] == 777
     and step["passes"] == 2,
     texts[0][:200],
+)
+
+err, undo, texts, _ = call("undo")
+_e, doc_after, _t, _i = call("get_document")
+s0 = doc_after["layers"][0]["steps"][0]
+check(
+    "one undo reverts the whole settings call",
+    not err
+    and s0["settings"]["power"] == before["power"]
+    and s0["settings"]["cut_speed"] == before["cut_speed"]
+    and s0["passes"] == before["passes"],
+    texts[0][:160],
+)
+check(
+    "undo says what it undid",
+    not err and "power" in (undo.get("undone") or ""),
+    undo.get("undone") if not err else "",
+)
+err, redo, texts, _ = call("redo")
+_e, doc_after, _t, _i = call("get_document")
+s0 = doc_after["layers"][0]["steps"][0]
+check(
+    "redo restores it and says so",
+    not err
+    and s0["settings"]["power"] == 0.42
+    and s0["passes"] == 2
+    and "power" in (redo.get("redone") or ""),
+    texts[0][:160],
 )
 
 err, _, texts, _ = call(
@@ -164,10 +219,11 @@ if wp:
         "set_workpiece", workpieces=[wp["uid"]], x=100, width=30
     )
     check(
-        "set_workpiece",
+        "set_workpiece: cut geometry x=100, width=30",
         not err
-        and abs(moved[0]["x"] - 100) < 0.01
-        and abs(moved[0]["width"] - 30) < 0.01,
+        and close(moved[0]["x"], 100)
+        and close(moved[0]["width"], 30)
+        and close(moved[0]["y"], 30),
         texts[0][:200],
     )
 
@@ -180,6 +236,13 @@ check(
     else f"{est['estimated_time']}, {est['total_distance_mm']} mm, "
     f"bbox {est.get('burn_bbox_mm')}, issues {est['sanity_issues']}",
 )
+if not err and est.get("burn_bbox_mm"):
+    x0, y0 = est["burn_bbox_mm"][0], est["burn_bbox_mm"][1]
+    check(
+        "toolpath starts exactly where the geometry was placed",
+        close(x0, 100) and close(y0, 30),
+        est["burn_bbox_mm"],
+    )
 
 err, _, texts, images = call("preview_toolpath", width_px=800)
 check("preview_toolpath", not err and images, texts[-1])
@@ -196,12 +259,27 @@ check(
 )
 if not err:
     print("      " + gcode["head"].replace("\n", "\n      "))
+    check(
+        "estimate and get_gcode agree on line count",
+        est.get("gcode_lines") == gcode["total_lines"],
+        f"{est.get('gcode_lines')} vs {gcode['total_lines']}",
+    )
 
-err, _, texts, _ = call("undo")
-check("undo", not err, texts[0][:120])
+err, undo, texts, _ = call("undo")
+check("undo", not err, undo.get("undone") if not err else texts[0])
 
 err, ms, texts, _ = call("machine_status")
 check("machine_status", not err, texts[0][:300])
+
+err, info, texts, _ = call("machine_info")
+check(
+    "machine_info without a real machine",
+    not err
+    and info.get("controller_settings") is None
+    and isinstance(info.get("heads"), list)
+    and info.get("connected") is False,
+    texts[0][:200] if err else info.get("controller_note"),
+)
 
 for name in ("machine_home", "machine_start_job", "machine_frame"):
     err, _, texts, _ = call(name)
