@@ -1,0 +1,17 @@
+name: mcp_bridge
+display_name: "MCP Bridge for AI Assistants"
+description: >-
+  Lets AI assistants such as Claude edit the open document over the Model
+  Context Protocol, and run the machine only after you approve in Rayforge.
+api_version: 19
+url: https://github.com/adihack/rayforge-mcp
+author:
+  name: "Adrian Soltys"
+  email: "adriansoltys@gmail.com"
+depends:
+  - rayforge>=1.13.0
+provides:
+  frontend: "mcp_bridge.frontend"
+license:
+  name: "MIT"
+maturity: experimental

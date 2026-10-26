@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# Virtual Environment
+.venv/
+venv/
+env/
+ENV/
+
+# Build artifacts & distribution
+build/
+dist/
+*.egg-info/
+*.whl
+
+# Tools
+.ruff_cache/
+
+# Compiled translations (Rayforge builds them on load)
+*.mo
+
+# Smoke test output
+preview*.png
+
+# IDE / Editor configuration
+.idea/
+.vscode/
+*.swp
+*.swo
