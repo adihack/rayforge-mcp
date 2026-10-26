@@ -3,9 +3,12 @@ MCP over Streamable HTTP (JSON responses, no server-initiated stream),
 and the controller that starts and stops the server.
 """
 
+import errno
+import gc
 import hmac
 import json
 import logging
+import sys
 import threading
 from gettext import gettext as _
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -27,6 +30,25 @@ PROTOCOL_VERSIONS = ("2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05")
 LOCAL_HOSTS = {"localhost", "127.0.0.1", "::1"}
 # Settings that only take effect after the listening socket is reopened.
 RESTART_KEYS = {"port", "allow_lan"}
+# Process-wide slot (on the Rayforge context, which outlives addon
+# reloads) holding the controller of the currently loaded copy.
+CONTROLLER_SLOT = "_mcp_bridge_controller"
+
+_THIS_MODULE = sys.modules[__name__]
+
+
+def is_current_copy() -> bool:
+    """
+    False once this copy of the addon was uninstalled or replaced.
+
+    Rayforge uninstalls and upgrades addons by dropping their modules
+    without calling on_unload, so a server can outlive its addon.
+    """
+    return (
+        sys.modules.get(__name__) is _THIS_MODULE
+        and ADDON_NAME in get_context().addon_mgr.loaded_addons
+    )
+
 
 INSTRUCTIONS = """\
 You are connected to Rayforge, a laser cutter/engraver app, through a \
@@ -192,12 +214,10 @@ class Handler(BaseHTTPRequestHandler):
         if self.path.split("?")[0] != MCP_PATH:
             self._send(404)
             return
-        if ADDON_NAME not in get_context().addon_mgr.loaded_addons:
-            # Uninstalling unloads the modules without calling
-            # on_unload, so the server notices on the next request.
-            message = "The MCP Bridge addon was removed from Rayforge."
+        if not is_current_copy():
+            message = "This copy of the MCP Bridge addon was removed."
             self._send_json(503, rpc_error(None, -32002, message))
-            GLib.idle_add(lambda: get_controller().stop() and False)
+            self.server.retire()
             return
         if not self._authorized():
             return
@@ -224,6 +244,25 @@ class Handler(BaseHTTPRequestHandler):
 
 class _Server(ThreadingHTTPServer):
     daemon_threads = True
+
+    def __init__(self, address, handler, controller):
+        super().__init__(address, handler)
+        self.controller = controller
+        self._retiring = False
+
+    def retire(self):
+        """Stop this server (once) because its addon copy is gone."""
+        if self._retiring:
+            return
+        self._retiring = True
+        logger.info("MCP bridge: addon copy replaced or removed, stopping")
+        GLib.idle_add(lambda: self.controller.stop() and False)
+
+    def service_actions(self):
+        # serve_forever calls this about twice a second, so an orphaned
+        # server stops soon after an uninstall or upgrade.
+        if not self._retiring and not is_current_copy():
+            self.retire()
 
 
 # ---------------------------------------------------------------------
@@ -257,13 +296,16 @@ class BridgeController:
         settings = self.settings
         self.error = settings.problem()
         if self.error is None:
+            self._retire_previous_copies(scan=False)
             try:
-                self._server = _Server((settings.host, settings.port), Handler)
+                self._server = self._bind(settings)
             except OSError as e:
                 self.error = _("Cannot listen on port {port}: {error}").format(
                     port=settings.port, error=e.strerror or e
                 )
-        if self._server is None:
+        if self._server is not None:
+            setattr(get_context(), CONTROLLER_SLOT, self)
+        else:
             logger.error(f"MCP bridge not started: {self.error}")
             tools.notify(
                 _("MCP server not started: {error}").format(error=self.error)
@@ -283,6 +325,47 @@ class BridgeController:
         tools.notify(_("MCP server running at {url}").format(url=where))
         self.changed.send(self)
         return True
+
+    def _bind(self, settings) -> "_Server":
+        address = (settings.host, settings.port)
+        try:
+            return _Server(address, Handler, self)
+        except OSError as e:
+            if e.errno != errno.EADDRINUSE:
+                raise
+            if not self._retire_previous_copies(scan=True):
+                raise
+        return _Server(address, Handler, self)
+
+    def _retire_previous_copies(self, scan: bool) -> bool:
+        """
+        Stop servers still run by earlier copies of this addon: an
+        upgrade or reinstall loads a new copy without unloading the old
+        one. The slot finds copies from 0.3.1 on; with ``scan``, older
+        copies are found among live objects. Returns True if any server
+        was stopped.
+        """
+        others = []
+        previous = getattr(get_context(), CONTROLLER_SLOT, None)
+        if previous is not None and previous is not self:
+            others.append(previous)
+        if scan:
+            for obj in gc.get_objects():
+                cls = type(obj)
+                if (
+                    cls.__name__ == "BridgeController"
+                    and cls.__module__ == __name__
+                    and obj is not self
+                    and all(obj is not other for other in others)
+                ):
+                    others.append(obj)
+        stopped = False
+        for other in others:
+            if getattr(other, "_server", None) is not None:
+                logger.info("MCP bridge: stopping a previous copy's server")
+                other.stop()
+                stopped = True
+        return stopped
 
     def stop(self) -> None:
         server = self._server

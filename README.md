@@ -146,9 +146,14 @@ headless:
   settings persisted at `0600`.
 - **Install from a git URL (13 checks)** through Rayforge's own
   installer: version taken from the `v0.2.0` tag; the menu toggle,
-  settings page and server all work without a restart. After uninstall,
-  the next request gets 503 and the server shuts down.
-- **Design tools (smoke test):** G-code carried the set power and speed;
+  settings page and server all work without a restart.
+- **Upgrades without restart (12 checks):** v0.2.0 → v0.3.0 → v0.3.1
+  installed over each other at runtime. v0.3.1 stopped the leftover
+  v0.2.0 server and took over the port in 0.6 s; reinstalling v0.3.1
+  handed over cleanly; after uninstall the port closed on its own in
+  0.4 s.
+- **Design tools (smoke test, 30 checks):** G-code carried the set power
+  and speed;
   passes scaled cut length exactly; imported geometry lands exactly at
   the requested x/y and size; one undo reverts a whole settings call.
 - **Machine flow** against a fake GRBL 1.1 controller (Rayforge's
@@ -166,6 +171,12 @@ imports.
 
 ## Changelog
 
+- **0.3.1**
+  - Upgrading or reinstalling no longer leaves the old version's server
+    holding the port. Rayforge loads the new copy without unloading the
+    old one, so the new copy now stops any earlier copy's server before
+    starting (including servers left by 0.2.0 and 0.3.0), and a server
+    whose copy was replaced or uninstalled stops itself within a second.
 - **0.3.0**
   - New read-only `machine_info` tool: machine setup plus the
     controller's settings, with checks for GRBL laser mode (`$32`), max
@@ -200,5 +211,7 @@ imports.
   - Installing at runtime runs neither `register_actions` nor
     `main_window_ready`, so on import the bridge attaches to an
     already-open window.
-  - Uninstalling does not call `on_unload`, so the server checks on
-    each request that the addon is still loaded and stops if not.
+  - Uninstalling and upgrading do not call `on_unload`; they drop the
+    old copy's modules and load the new copy. The server checks twice a
+    second whether its copy is still the loaded one and stops if not,
+    and a new copy stops any earlier copy's server before it starts.
