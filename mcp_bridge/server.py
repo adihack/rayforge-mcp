@@ -67,6 +67,16 @@ turn its workpieces into toolpaths. Call get_document first.
 Typical flow: get_document -> import_svg -> set_step_settings -> \
 estimate_job / preview_toolpath -> machine_start_job.
 
+Layers run in order. Hiding a layer (visible=false) only affects the \
+canvas; hidden layers are still burned. To frame or run only some \
+layers, disable the others with update_layer(enabled=false) and enable \
+them again afterwards. To cut or engrave by colour, use \
+import_svg(split_by_color=true) and set each new layer's steps.
+
+Avoid Offset Fill for text and detailed shapes: on some shapes it \
+freezes Rayforge (the app stops responding and has to be closed). Use \
+Engrave (raster) for fills. Speeds above the machine's maximum are refused.
+
 Before the first machine action on a machine, call machine_info and \
 tell the user about any "checks" it reports (e.g. GRBL laser mode off).
 

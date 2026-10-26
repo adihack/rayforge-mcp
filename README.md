@@ -78,15 +78,17 @@ and the text HELLO, cut at 80% / 400 mm/min, and show me the preview."*
 
 | Tool | What it does | Approval |
 |---|---|---|
-| `get_document` | Machine, layers, steps (power/speed/passes), workpieces (mm) | – |
+| `get_document` | Machine (with active WCS), layers, steps (power/speed/passes, warnings), workpieces (mm) | – |
 | `list_step_types`, `describe_step_settings` | Available operations; each setting with range/choices/units | – |
-| `import_svg`, `import_file` | Add SVG markup or a file (SVG/DXF/PDF/PNG…), optional name, x/y/size | – |
-| `set_workpiece`, `remove_workpieces` | Move / resize / rotate / delete | – |
-| `add_layer`, `set_active_layer`, `add_step`, `remove_step` | Layer and workflow setup | – |
-| `set_step_settings` | e.g. `{"power": 0.6, "cut_speed": 800, "passes": 2}`, one undo step per call | – |
-| `estimate_job` | Time, distances, bounding boxes, Rayforge sanity-check warnings | – |
+| `import_svg`, `import_file` | Add SVG markup or a file (SVG/DXF/PDF/PNG…), optional name, x/y/size; `split_by_color` puts each colour on its own layer | – |
+| `set_workpiece`, `remove_workpieces` | Move / resize / rotate / move to another layer / delete | – |
+| `add_layer`, `set_active_layer`, `update_layer`, `remove_layer` | Create, rename, reorder, show/hide, enable/disable, delete layers | – |
+| `add_step`, `remove_step` | Workflow setup; new steps start within the machine's speed limits | – |
+| `set_step_settings` | e.g. `{"power": 0.6, "cut_speed": 800, "passes": 2, "enabled": false}`, one undo step per call | – |
+| `estimate_job` | Time (total and per layer), distances, bounding boxes, Rayforge sanity-check warnings | – |
 | `preview_toolpath` | PNG of the generated toolpath on the work area | – |
 | `get_gcode`, `save_project` | Machine code head / save to file; save `.ryp` | – |
+| `new_document`, `open_project` | Start an empty document / open a `.ryp`; unsaved changes are never dropped without asking in Rayforge | – |
 | `undo`, `redo` | Rayforge's undo stack; report what changed and what's next | – |
 | `machine_info` | Machine setup plus the controller's own settings (GRBL `$$`), with checks such as laser mode `$32` and max power `$30` | never |
 | `machine_status`, `machine_pause`, `machine_stop` | State/position/progress; feed hold; cancel | never |
@@ -94,6 +96,14 @@ and the text HELLO, cut at 80% / 400 mm/min, and show me the preview."*
 
 Design edits use Rayforge's own undoable commands, so they show up live
 and `Ctrl+Z` works.
+
+Rayforge burns every layer, including hidden ones: hiding a layer only
+affects the canvas. To frame or run only some layers, disable the
+others with `update_layer(enabled=false)`, which turns their steps off.
+
+Speeds above the machine's maximum are refused. New steps, including
+the default steps Rayforge adds to a layer on import, are brought
+within the machine's limits.
 
 A workpiece's `x`, `y`, `width` and `height` describe the geometry the
 laser follows. Rayforge pads imported SVGs with a small margin, so the
@@ -109,6 +119,11 @@ as `frame`. Placing a 60×40 mm design at x=20 puts the cut at x=20.
   sanity-check warnings), never from text the AI wrote.
 - One approval at a time. `machine_stop`, `machine_pause` and
   `machine_status` never wait, even while a dialog is open.
+- Motion commands are refused while the controller is busy (homing,
+  running, jogging); homing is also allowed from ALARM.
+- The frame and job dialogs list the steps that will run and say
+  where the head goes at the end (Rayforge's `G0 X0 Y0` in the
+  active work coordinate system).
 - Turning the server off (or disabling the addon) closes a pending
   dialog, and a late click on Allow does nothing.
 - Starting a job goes through Rayforge's normal Send action, so its own
@@ -152,24 +167,68 @@ headless:
   v0.2.0 server and took over the port in 0.6 s; reinstalling v0.3.1
   handed over cleanly; after uninstall the port closed on its own in
   0.4 s.
-- **Design tools (smoke test, 30 checks):** G-code carried the set power
-  and speed;
-  passes scaled cut length exactly; imported geometry lands exactly at
-  the requested x/y and size; one undo reverts a whole settings call.
+- **Design tools (smoke test, 53 checks):** G-code carried the set power
+  and speed; passes scaled cut length exactly; imported geometry lands
+  exactly at the requested x/y and size; one undo reverts a whole
+  settings call. Since 0.4.0 it also covers the following:
+  - choice settings by label or name
+  - speed limits
+  - colour split
+  - layer rename, reorder, hide and disable (one undo step)
+  - per-layer times that add up to the total
+  - moving workpieces between layers
+  - save, new and open document
 - **Machine flow** against a fake GRBL 1.1 controller (Rayforge's
   GRBL-telnet driver). A denied job streamed nothing. An approved job
   streamed `M4 S350`. Pause/resume/stop sent `!`/`~`/soft reset, then
   `M5`. Jog sent `$J=…` and home sent `$H`. A timed-out request sent
   nothing, and stop/status answered instantly while a dialog was open.
   `machine_info` flagged `$32=0` and a `$30` mismatch, and reported no
-  checks for a correctly configured controller.
+  checks for a correctly configured controller. With a controller that
+  takes 15 s to home, Rayforge gave up after 10 s, and `machine_home`
+  followed the controller and reported success after 15.5 s. With a
+  12 s limit it reported "still homing", and frame and jog were refused
+  until the controller was idle.
+- **Real hardware (0.3.1):** TwoTrees TTC-H40 (grblHAL, 20 W diode).
+  Tested `machine_info`, home, jog, frame, and a 10–100 % power-test
+  job.
 - **Snap Rayforge 1.13.1** (strict confinement): installed with Install
   from URL and used for a design-only session from Claude Code.
 
-**Not tested yet:** a real laser, Windows/macOS, Flatpak, raster-image
-imports.
+**Not tested yet:** Windows/macOS, Flatpak, raster-image imports; the
+0.4.0 changes on real hardware.
 
 ## Changelog
+
+- **0.4.0**
+  - Fixed: choice settings such as `depth_mode` and `scan_mode`
+    rejected both their name (`CONSTANT_POWER`) and their label
+    (`Constant Power`). Both now work, in any case.
+  - Speeds above the machine's maximum are refused. New steps,
+    including Rayforge's default steps on import, start within the
+    machine's limits; they used to start at 5000 mm/min travel.
+  - New tools:
+    - `update_layer`: rename, reorder, show/hide, enable/disable
+    - `remove_layer`
+    - `new_document`
+    - `open_project`
+  - `set_step_settings` takes `enabled`. `set_workpiece` can move
+    workpieces to another layer.
+  - `import_svg`/`import_file` take `split_by_color`: one layer per
+    colour, placed as one design.
+  - `estimate_job` gives the time per layer, split by operation.
+  - `get_document`/`machine_info` report the active work coordinate
+    system, its offset, and where the head goes after a job.
+  - `machine_home` waits until homing has finished and reports how it
+    ended. If Rayforge stops waiting early (its limit is 10 s), the
+    tool keeps watching the controller.
+  - Motion commands are refused while the controller is busy.
+  - The approval dialogs now do the following:
+    - list steps on hidden layers, which still burn
+    - say where the head goes at the end
+  - Offset Fill steps carry a warning. On some shapes (e.g. outlined
+    text at a 0.08 mm interval) Rayforge 1.13's ring computation never
+    ends and freezes the app. The bridge cannot interrupt it.
 
 - **0.3.1**
   - Upgrading or reinstalling no longer leaves the old version's server
@@ -201,6 +260,12 @@ imports.
   A Rayforge update could break it.
 - `machine_jog` uses machine axis directions. On machines with reversed
   axes, "+X" may differ from the arrow in the UI.
+- Offset Fill can freeze Rayforge on some shapes. The computation runs
+  inside Rayforge, so the bridge cannot time it out; avoid Offset Fill
+  for text and detailed shapes, or use a line interval of 0.2 mm or
+  more.
+- `new_document` uses a private Rayforge method
+  (`ProjectCmd._do_create_new_project`).
 - Only stateless HTTP is implemented. There are no server→client
   notifications, so clients poll `machine_status` for progress.
 - Workarounds for Rayforge addon-lifecycle quirks:

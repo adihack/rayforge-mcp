@@ -32,6 +32,13 @@ from rayforge.context import get_context
 from rayforge.core.step_registry import step_registry
 from rayforge.core.undo.command import Command
 from rayforge.core.undo.list_cmd import ListItemCommand
+from rayforge.core.undo.property_cmd import ChangePropertyCommand
+from rayforge.core.vectorization_spec import (
+    LayerImportMode,
+    LayerSource,
+    PassthroughSpec,
+    color_attr_from_value,
+)
 from rayforge.machine.driver.dummy import NoDeviceDriver
 from rayforge.machine.sanity.checker import SanityChecker
 from rayforge.machine.sanity.result import CheckMode
@@ -46,6 +53,16 @@ IMPORT_DIR = Path(tempfile.gettempdir()) / "rayforge-mcp-imports"
 # Treats Rayforge's "no device" placeholder driver as a machine, to try
 # the approval dialogs without hardware.
 DEMO = os.environ.get("RAYFORGE_MCP_DEMO") == "1"
+SPEED_KEYS = ("cut_speed", "travel_speed")
+# Rayforge 1.13 computes Offset Fill rings on its main thread, and on
+# some shapes the ring loop never ends, which freezes the whole app.
+OFFSET_FILL_NOTE = (
+    "Offset Fill can freeze Rayforge on some shapes (seen with outlined "
+    "text at the default 0.08 mm interval). Prefer Engrave (raster) for "
+    "filled text and detailed shapes. If you use Offset Fill, set "
+    "line_interval_mm to 0.2 or more first, then add one shape at a "
+    "time and check with estimate_job."
+)
 
 win = None
 
@@ -259,15 +276,33 @@ def describe_step(step, index):
     passes = 1
     if mp is not None and mp.get("enabled", True):
         passes = int(mp.get("passes", 1))
-    return {
+    info = {
         "index": index,
         "uid": step.uid,
         "name": step.name,
         "type": type(step).__name__,
-        "visible": step.visible,
+        "enabled": step.visible,
         "passes": passes,
         "settings": step_settings(step),
     }
+    warnings = step_warnings(step)
+    if warnings:
+        info["warnings"] = warnings
+    return info
+
+
+def step_warnings(step):
+    warnings = []
+    for key, limit in speed_limits(step).items():
+        value = getattr(step, key, None)
+        if limit and value and value > limit:
+            warnings.append(
+                f"{key} {value} mm/min is above the machine's maximum of "
+                f"{limit} mm/min"
+            )
+    if type(step).__name__ == "OffsetFillStep":
+        warnings.append(OFFSET_FILL_NOTE)
+    return warnings
 
 
 def to_machine_rect(bbox):
@@ -331,14 +366,50 @@ def describe_machine(m):
         and not isinstance(m.driver, NoDeviceDriver),
         "max_cut_speed": m.max_cut_speed,
         "max_travel_speed": m.max_travel_speed,
+        "work_coordinates": describe_wcs(m),
     }
+
+
+def describe_wcs(m):
+    """The active work coordinate system and its offset from machine 0."""
+    offset = m.get_active_wcs_offset()
+    info = {
+        "active": m.active_wcs,
+        "label": m.get_wcs_label(m.active_wcs),
+        "offset_mm": [rnd(v) for v in offset],
+        "note": "Positions in tools are machine coordinates; Rayforge "
+        "converts them to the active WCS when it sends the job.",
+    }
+    end_move = end_move_text(m)
+    if end_move:
+        info["after_job"] = end_move
+    return info
+
+
+def end_move_text(m):
+    """Where the dialect's end-of-job script sends the head, if anywhere."""
+    dialect = getattr(m, "dialect", None)
+    for line in getattr(dialect, "postscript", None) or []:
+        code = line.split(";", 1)[0].strip().upper()
+        if not re.match(r"G0?[01]\b", code) or "G53" in code:
+            continue
+        x = re.search(r"X(-?[0-9.]+)", code)
+        y = re.search(r"Y(-?[0-9.]+)", code)
+        if not (x and y):
+            continue
+        ox, oy, _oz = m.get_active_wcs_offset()
+        mx, my = float(x.group(1)) + ox, float(y.group(1)) + oy
+        return (
+            f"At the end Rayforge sends '{code}' ({m.active_wcs}), so the "
+            f"head moves to machine X{mx:g} Y{my:g}."
+        )
+    return None
 
 
 def summarize_steps_for_humans():
     lines = []
+    # Hidden layers are still part of the job; only disabled steps are not.
     for layer in doc().layers:
-        if not layer.visible:
-            continue
         for step in layer_steps(layer):
             if not step.visible or not layer.all_workpieces:
                 continue
@@ -352,7 +423,7 @@ def summarize_steps_for_humans():
             if info["passes"] > 1:
                 parts.append(f"{info['passes']} passes")
             lines.append("  - " + ", ".join(parts))
-    return "\n".join(lines) or "  (no visible steps with workpieces)"
+    return "\n".join(lines) or "  (no enabled steps with workpieces)"
 
 
 class RecipeValueCommand(Command):
@@ -374,14 +445,60 @@ class RecipeValueCommand(Command):
         self.step.updated.send(self.step)
 
 
+def labeled_choices(var):
+    """{stored name: label} for a LabeledChoiceVar, else None."""
+    labels = getattr(var, "_value_to_label", None)
+    if not labels:
+        return None
+    return {str(getattr(k, "name", k)): str(v) for k, v in labels.items()}
+
+
+def speed_limits(step=None):
+    """Max cut/travel speed (mm/min): the machine's, or the step's if lower."""
+    m = machine()
+    limits = {}
+    for key in SPEED_KEYS:
+        caps = [
+            getattr(m, f"max_{key}", None) if m else None,
+            getattr(step, f"max_{key}", None) if step else None,
+        ]
+        caps = [c for c in caps if c]
+        limits[key] = min(caps) if caps else None
+    return limits
+
+
+def clamp_new_step_speeds(step):
+    """
+    New steps start with Rayforge's generic defaults (travel 5000 mm/min)
+    whatever the machine allows. Bring them within the machine's limits.
+    """
+    adjusted = {}
+    for key, limit in speed_limits(step).items():
+        value = getattr(step, key, None)
+        if limit and value and value > limit:
+            # The step's setter also tells the pipeline to regenerate.
+            getattr(step, f"set_{key}")(int(limit))
+            adjusted[key] = {"from": value, "to": int(limit)}
+    return adjusted
+
+
 def coerce_setting(var, key, value):
     """
     Validate and coerce a value using the step's own Var definition.
     The var must be a fresh instance (recipe_varset() builds new ones).
     """
-    labels = getattr(var, "_label_to_value", None)
-    if labels and isinstance(value, str) and value in labels:
-        value = labels[value]
+    names = labeled_choices(var)
+    if names is not None:
+        # Labeled choices store a name ("CONSTANT_POWER") and show a
+        # label ("Constant Power"); accept either, in any case.
+        wanted = str(value).strip().casefold()
+        for name, label in names.items():
+            if wanted in (name.casefold(), label.casefold()):
+                return name
+        raise ToolError(
+            f"{key}={value!r} must be one of {list(names)} "
+            f"(labels: {list(names.values())})"
+        )
     try:
         var.value = value
     except (TypeError, ValueError) as e:
@@ -400,11 +517,8 @@ def coerce_setting(var, key, value):
                 f"{key}={value!r} is outside {min_val}..{max_val}{hint}"
             )
     choices = getattr(var, "choices", None)
-    if choices:
-        allowed = [c[1] if isinstance(c, tuple) else c for c in choices]
-        names = [getattr(a, "name", a) for a in allowed]
-        if coerced not in allowed and coerced not in names:
-            raise ToolError(f"{key}={value!r} must be one of {names}")
+    if choices and coerced not in choices:
+        raise ToolError(f"{key}={value!r} must be one of {list(choices)}")
     return coerced
 
 
@@ -441,6 +555,42 @@ def apply_placement(items, args):
             ty = start_y if y is None else float(y)
             if abs(tx - cx) > 1e-6 or abs(ty - cy) > 1e-6:
                 transform.set_position([item], fx + tx - cx, fy + ty - cy)
+
+
+def union_rect(rects):
+    x0 = min(r[0] for r in rects)
+    y0 = min(r[1] for r in rects)
+    x1 = max(r[0] + r[2] for r in rects)
+    y1 = max(r[1] + r[3] for r in rects)
+    return x0, y0, x1 - x0, y1 - y0
+
+
+def group_rects(items):
+    """Like item_rects, for the combined box of several items."""
+    rects = [item_rects(item) for item in items]
+    return union_rect([r[0] for r in rects]), union_rect([r[1] for r in rects])
+
+
+def apply_placement_group(items, args):
+    """Resize and move several items as one design, keeping their layout."""
+    transform = editor().transform
+    width = args.get("width")
+    height = args.get("height")
+    (start_x, start_y, cw, ch), (_fx, _fy, fw, fh) = group_rects(items)
+    resizing = width is not None or height is not None
+    if resizing:
+        sx = float(width) / cw if width is not None and cw > 0 else None
+        sy = float(height) / ch if height is not None and ch > 0 else None
+        if args.get("keep_aspect", True):
+            sx = sy = sx if sx is not None else sy
+        sx = 1.0 if sx is None else sx
+        sy = 1.0 if sy is None else sy
+        transform.set_size_group(items, width=fw * sx, height=fh * sy)
+    (cx, cy, _w, _h), (fx, fy, _fw, _fh) = group_rects(items)
+    tx = start_x if args.get("x") is None else float(args["x"])
+    ty = start_y if args.get("y") is None else float(args["y"])
+    if abs(tx - cx) > 1e-6 or abs(ty - cy) > 1e-6:
+        transform.set_position_group(items, fx + tx - cx, fy + ty - cy)
 
 
 # ---------------------------------------------------------------------
@@ -506,6 +656,56 @@ def job_summary(job):
     gcode = job.get("gcode")
     summary["gcode_lines"] = len(gcode.splitlines()) if gcode else 0
     return summary
+
+
+def time_by_layer(ops):
+    """
+    Split the job's estimated time by layer (and by operation within
+    each layer), using the same per-command estimate as Rayforge's total.
+    Moves between layers count towards the layer they lead to.
+    """
+    m = on_main(machine)
+    if m is None:
+        return []
+    times = ops.estimate_command_times(
+        float(m.max_cut_speed),
+        float(m.max_travel_speed),
+        float(m.acceleration),
+    )
+    types = ops.to_numpy_arrays()["types"]
+    layer_start = CommandType.LAYER_START.value
+    section_start = CommandType.OPS_SECTION_START.value
+    totals = {}
+    current = None
+    operation = None
+    for i, kind in enumerate(types):
+        kind = int(kind)
+        if kind == layer_start:
+            current = ops.layer_uid(i)
+            operation = None
+            totals.setdefault(current, {"seconds": 0.0, "operations": {}})
+        elif kind == section_start:
+            params = ops.section_params(i)
+            operation = params[1] if params and len(params) > 1 else None
+        if current is None:
+            continue
+        entry = totals[current]
+        entry["seconds"] += times[i]
+        if operation:
+            ops_times = entry["operations"]
+            ops_times[operation] = ops_times.get(operation, 0.0) + times[i]
+    names = on_main(lambda: {layer.uid: layer.name for layer in doc().layers})
+    return [
+        {
+            "layer": names.get(uid, uid),
+            "seconds": rnd(entry["seconds"], 1),
+            "time": fmt_duration(entry["seconds"]),
+            "operations": {
+                k: rnd(v, 1) for k, v in entry["operations"].items()
+            },
+        }
+        for uid, entry in totals.items()
+    ]
 
 
 def sanity_issues(ops):
@@ -621,7 +821,12 @@ CONFIRM_FOOTER = (
 )
 
 
-def confirm(heading, body):
+def confirm(
+    heading,
+    body,
+    footer=CONFIRM_FOOTER,
+    unchanged="Nothing was sent to the machine.",
+):
     """Ask the operator in Rayforge; raise ToolError unless allowed."""
     if not _confirm_lock.acquire(blocking=False):
         raise ToolError("Another approval is already waiting in Rayforge.")
@@ -631,9 +836,7 @@ def confirm(heading, body):
         box = {"answer": "deny"}
 
         def show():
-            dialog = Adw.AlertDialog(
-                heading=heading, body=body + CONFIRM_FOOTER
-            )
+            dialog = Adw.AlertDialog(heading=heading, body=body + footer)
             dialog.add_response("deny", "Deny")
             dialog.add_response("allow", "Allow")
             dialog.set_response_appearance(
@@ -657,18 +860,12 @@ def confirm(heading, body):
         logger.info(f"Waiting for operator approval: {heading}")
         if not done.wait(timeout):
             on_main(lambda: box["dialog"].force_close())
-            raise ToolError(
-                f"No approval within {timeout}s. Nothing was sent to the "
-                "machine."
-            )
+            raise ToolError(f"No approval within {timeout}s. {unchanged}")
         if box["answer"] == "cancelled":
-            raise ToolError(
-                "The MCP server was stopped. Nothing was sent to the machine."
-            )
+            raise ToolError(f"The MCP server was stopped. {unchanged}")
         if box["answer"] != "allow":
             raise ToolError(
-                "The operator denied this in Rayforge. Nothing was sent to "
-                "the machine."
+                f"The operator denied this in Rayforge. {unchanged}"
             )
         logger.info(f"Operator approved: {heading}")
     finally:
@@ -692,7 +889,13 @@ def cancel_pending_confirmation():
         dialog.force_close()
 
 
-def require_machine(connected=True, idle=True):
+# Controller states in which a new motion command may be sent. UNKNOWN
+# covers drivers that do not report a state.
+READY_STATES = ("IDLE", "UNKNOWN")
+HOME_STATES = READY_STATES + ("ALARM",)
+
+
+def require_machine(connected=True, idle=True, states=READY_STATES):
     m = machine()
     if m is None:
         raise ToolError("No machine is configured in Rayforge.")
@@ -707,6 +910,12 @@ def require_machine(connected=True, idle=True):
         )
     if idle and win.machine_cmd.is_job_running:
         raise ToolError("A job is running. Pause or stop it first.")
+    status = getattr(m.device_state.status, "name", "UNKNOWN")
+    if idle and connected and status not in states:
+        raise ToolError(
+            f"The controller is busy ({status}). Wait until it is idle; "
+            "check with machine_status."
+        )
     return m
 
 
@@ -896,7 +1105,7 @@ def t_get_document(args):
 @tool(
     "list_step_types",
     "List the step (operation) types that can be added to a layer, "
-    "e.g. Contour (cut/score lines) or Raster (engrave fills/images).",
+    "e.g. Contour (cut/score lines) or Engrave (raster fills/images).",
     read_only=True,
 )
 def t_list_step_types(args):
@@ -933,11 +1142,7 @@ def t_describe_step_settings(args):
         layer = find_layer(args.get("layer"))
         step = find_step(layer, args.get("step"))
         current = step_settings(step)
-        m = machine()
-        speed_limits = {
-            "cut_speed": m.max_cut_speed if m else None,
-            "travel_speed": m.max_travel_speed if m else None,
-        }
+        limits = speed_limits(step)
         settings = []
         for var in type(step).recipe_varset():
             entry = {
@@ -954,19 +1159,27 @@ def t_describe_step_settings(args):
                 entry["description"] = (
                     "Laser power as a fraction 0.0-1.0 (0.8 = 80 %)"
                 )
-            if var.key in speed_limits:
+            if var.key in limits:
                 entry["unit"] = "mm/min"
-                if speed_limits[var.key]:
-                    entry["machine_max"] = speed_limits[var.key]
-            labels = getattr(var, "_value_to_label", None)
-            if labels:
-                entry["choices"] = {
-                    str(getattr(k, "name", k)): str(v)
-                    for k, v in labels.items()
-                }
+                if limits[var.key]:
+                    entry["max"] = limits[var.key]
+            names = labeled_choices(var)
+            if names:
+                # Name -> label; set_step_settings accepts either.
+                entry["choices"] = names
             elif getattr(var, "choices", None):
                 entry["choices"] = list(var.choices)
             settings.append(entry)
+        settings.append(
+            {
+                "key": "enabled",
+                "label": "Enabled",
+                "description": "Whether the step is part of the job. "
+                "Disabled steps are not framed or burned.",
+                "value": step.visible,
+                "default": True,
+            }
+        )
         if multipass_dict(step) is not None:
             settings.append(
                 {
@@ -978,7 +1191,11 @@ def t_describe_step_settings(args):
                     "min": 1,
                 }
             )
-        return {"layer": layer.name, "step": step.name, "settings": settings}
+        result = {"layer": layer.name, "step": step.name, "settings": settings}
+        warnings = step_warnings(step)
+        if warnings:
+            result["warnings"] = warnings
+        return result
 
     return on_main(run)
 
@@ -986,7 +1203,9 @@ def t_describe_step_settings(args):
 @tool(
     "set_step_settings",
     'Change settings of a step, e.g. {"power": 0.6, "cut_speed": 800, '
-    '"passes": 2}. power is a fraction 0.0-1.0; speeds are mm/min. One '
+    '"passes": 2}. power is a fraction 0.0-1.0; speeds are mm/min and '
+    'may not exceed the machine maximum. {"enabled": false} leaves the '
+    "step out of the job. Choices accept the name or the label. One "
     "call is one undo step.",
     {
         "layer": LAYER_ARG,
@@ -1009,8 +1228,14 @@ def t_set_step_settings(args):
         step = find_step(layer, args.get("step"))
         cls = type(step)
         varset = {var.key: var for var in cls.recipe_varset()}
+        limits = speed_limits(step)
         planned = []
         for key, value in settings.items():
+            if key == "enabled":
+                if not isinstance(value, bool):
+                    raise ToolError("enabled must be true or false.")
+                planned.append(("enabled", step, value))
+                continue
             if key == "passes":
                 t_dict = multipass_dict(step)
                 if t_dict is None:
@@ -1023,9 +1248,15 @@ def t_set_step_settings(args):
             if key not in varset:
                 raise ToolError(
                     f"Unknown setting {key!r} for {cls.__name__}. Valid: "
-                    f"{sorted(varset) + ['passes']}"
+                    f"{sorted(varset) + ['enabled', 'passes']}"
                 )
             new_value = coerce_setting(varset[key], key, value)
+            limit = limits.get(key)
+            if limit and new_value > limit:
+                raise ToolError(
+                    f"{key}={new_value} mm/min is above this machine's "
+                    f"maximum of {limit} mm/min."
+                )
             old_value = cls.recipe_value(key, getattr(step, key, None))
             planned.append((key, step, (new_value, old_value)))
 
@@ -1035,6 +1266,20 @@ def t_set_step_settings(args):
         # One call is one undo step, however many settings it changes.
         with history.transaction(label):
             for key, target, payload in planned:
+                if key == "enabled":
+                    if target.visible != payload:
+                        history.execute(
+                            ChangePropertyCommand(
+                                target=target,
+                                property_name="visible",
+                                new_value=payload,
+                                setter_method_name="set_visible",
+                                name="MCP: enable step"
+                                if payload
+                                else "MCP: disable step",
+                            )
+                        )
+                    continue
                 if key != "passes":
                     new_value, old_value = payload
                     history.execute(
@@ -1065,7 +1310,8 @@ def t_set_step_settings(args):
 
 @tool(
     "add_layer",
-    "Add a new layer (it becomes the active layer, so imports land on it).",
+    "Add a new layer (it becomes the active layer, so imports land on it). "
+    "Rayforge gives it default steps when the first design is imported.",
     {"name": {"type": "string"}},
 )
 def t_add_layer(args):
@@ -1105,10 +1351,108 @@ def t_set_active_layer(args):
     return on_main(run)
 
 
+def describe_layer(layer, index):
+    return {
+        "index": index,
+        "uid": layer.uid,
+        "name": layer.name,
+        "visible": layer.visible,
+        "steps": [
+            describe_step(s, j) for j, s in enumerate(layer_steps(layer))
+        ],
+        "workpieces": [wp.name for wp in layer.all_workpieces],
+    }
+
+
+@tool(
+    "update_layer",
+    "Rename, reorder, show/hide or enable/disable a layer. 'visible' only "
+    "affects the canvas: hidden layers are still burned. 'enabled' turns "
+    "all of the layer's steps on or off, which is how to frame or run "
+    "only some layers. Only the given fields change; one undo step.",
+    {
+        "layer": LAYER_ARG,
+        "name": {"type": "string"},
+        "index": {
+            "type": "integer",
+            "description": "New position (0 = first; layers run in order).",
+        },
+        "visible": {"type": "boolean"},
+        "enabled": {"type": "boolean"},
+    },
+    required=("layer",),
+)
+def t_update_layer(args):
+    changes = [k for k in ("name", "index", "visible", "enabled") if k in args]
+    if not changes:
+        raise ToolError("Give at least one of name, index, visible, enabled.")
+
+    def run():
+        layer = find_layer(args["layer"])
+        layer_cmd = editor().layer
+        layers = list(doc().layers)
+        if "index" in args and not 0 <= int(args["index"]) < len(layers):
+            raise ToolError(f"index must be 0..{len(layers) - 1}")
+        history = editor().history_manager
+        with history.transaction(f"MCP: update layer {layer.name}"):
+            if args.get("name"):
+                layer_cmd.rename_layer(layer, str(args["name"]))
+            if "visible" in args:
+                layer_cmd.set_layer_visibility(layer, bool(args["visible"]))
+            if "enabled" in args:
+                enabled = bool(args["enabled"])
+                for step in layer_steps(layer):
+                    if step.visible != enabled:
+                        history.execute(
+                            ChangePropertyCommand(
+                                target=step,
+                                property_name="visible",
+                                new_value=enabled,
+                                setter_method_name="set_visible",
+                                name="MCP: enable layer",
+                            )
+                        )
+            if "index" in args:
+                order = [item for item in layers if item is not layer]
+                order.insert(int(args["index"]), layer)
+                if order != layers:
+                    layer_cmd.reorder_layers(order)
+        return describe_layer(layer, list(doc().layers).index(layer))
+
+    result = on_main(run)
+    editor().wait_until_settled_sync(timeout=30.0)
+    return result
+
+
+@tool(
+    "remove_layer",
+    "Delete a layer together with its workpieces and steps (undoable). "
+    "The document must keep at least one layer.",
+    {"layer": LAYER_ARG},
+    required=("layer",),
+    destructive=True,
+)
+def t_remove_layer(args):
+    def run():
+        layer = find_layer(args["layer"])
+        if len(doc().layers) < 2:
+            raise ToolError("This is the only layer; a document needs one.")
+        removed = {
+            "removed": layer.name,
+            "workpieces": [wp.name for wp in layer.all_workpieces],
+        }
+        editor().layer.delete_layer(layer)
+        removed["active_layer"] = doc().active_layer.name
+        return removed
+
+    return on_main(run)
+
+
 @tool(
     "add_step",
     "Add a step (operation) to a layer's workflow, e.g. step_type "
-    '"ContourStep" or "Contour". See list_step_types.',
+    '"Contour" or "Engrave" (raster). See list_step_types. Its speeds '
+    "start within the machine's limits.",
     {"layer": LAYER_ARG, "step_type": {"type": "string"}},
     required=("step_type",),
 )
@@ -1118,6 +1462,9 @@ def t_add_step(args):
         if layer.workflow is None:
             raise ToolError(f"Layer {layer.name!r} has no workflow.")
         wanted = str(args["step_type"])
+        # Rayforge calls its raster operation "Engrave".
+        if wanted.lower() in ("raster", "rasterstep"):
+            wanted = "EngraveStep"
         cls = step_registry.get(wanted) or step_registry.get_by_typelabel(
             wanted
         )
@@ -1137,6 +1484,7 @@ def t_add_step(args):
             )
         step = cls.create(get_context())
         editor().step.apply_best_recipe_to_step(step)
+        adjusted = clamp_new_step_speeds(step)
         editor().history_manager.execute(
             ListItemCommand(
                 owner_obj=layer.workflow,
@@ -1146,7 +1494,10 @@ def t_add_step(args):
                 name=f"MCP: add step {step.name}",
             )
         )
-        return describe_step(step, layer_steps(layer).index(step))
+        info = describe_step(step, layer_steps(layer).index(step))
+        if adjusted:
+            info["speeds_limited_to_machine"] = adjusted
+        return info
 
     return on_main(run)
 
@@ -1176,16 +1527,27 @@ def t_remove_step(args):
     return on_main(run)
 
 
-def import_path(path, mime_type, args, timeout=60.0):
+def all_step_uids():
+    return {s.uid for layer in doc().layers for s in layer_steps(layer)}
+
+
+def import_path(path, mime_type, args, spec=None, timeout=60.0):
     """Import a file into the active layer and return the new items."""
     if args.get("layer") is not None:
         on_main(
             lambda: editor().layer.set_active_layer(find_layer(args["layer"]))
         )
 
-    before = on_main(lambda: {wp.uid for wp in doc().all_workpieces})
+    def snapshot():
+        return (
+            {wp.uid for wp in doc().all_workpieces},
+            {layer.uid for layer in doc().layers},
+            all_step_uids(),
+        )
+
+    before, layers_before, steps_before = on_main(snapshot)
     on_main(
-        lambda: editor().file.load_file_from_path(Path(path), mime_type, None)
+        lambda: editor().file.load_file_from_path(Path(path), mime_type, spec)
     )
 
     deadline = time.monotonic() + timeout
@@ -1206,12 +1568,38 @@ def import_path(path, mime_type, args, timeout=60.0):
 
     def place():
         items = [wp for wp in doc().all_workpieces if wp.uid in new_uids]
-        apply_placement(items, args)
-        return [describe_workpiece(wp) for wp in items]
+        if len(items) > 1 and any(
+            args.get(k) is not None for k in ("x", "y", "width", "height")
+        ):
+            # Place the import as a whole, like Rayforge's own import.
+            apply_placement_group(items, args)
+        else:
+            apply_placement(items, args)
+        # Rayforge adds default steps to layers that receive their first
+        # design, with generic speeds; keep those within machine limits.
+        adjusted = {}
+        for layer in doc().layers:
+            for step in layer_steps(layer):
+                if step.uid not in steps_before:
+                    changed = clamp_new_step_speeds(step)
+                    if changed:
+                        adjusted[f"{layer.name} / {step.name}"] = changed
+        result = {"imported": [describe_workpiece(wp) for wp in items]}
+        layers = list(doc().layers)
+        new_layers = [
+            describe_layer(layer, layers.index(layer))
+            for layer in layers
+            if layer.uid not in layers_before
+        ]
+        if new_layers:
+            result["new_layers"] = new_layers
+        if adjusted:
+            result["speeds_limited_to_machine"] = adjusted
+        return result
 
-    items = on_main(place)
+    result = on_main(place)
     editor().wait_until_settled_sync(timeout=30.0)
-    return {"imported": items}
+    return result
 
 
 PLACEMENT_ARGS = {
@@ -1224,15 +1612,43 @@ PLACEMENT_ARGS = {
 }
 
 
+SPLIT_ARGS = {
+    "split_by_color": {
+        "type": "boolean",
+        "default": False,
+        "description": "Put each colour on a layer of its own (e.g. red "
+        "= cut, black = engrave), then set each layer's steps.",
+    },
+    "color_from": {
+        "type": "string",
+        "enum": ["any", "stroke", "fill", "fill_else_stroke"],
+        "default": "any",
+        "description": "With split_by_color: which colour of a shape counts.",
+    },
+}
+
+
+def import_spec(args):
+    if not args.get("split_by_color"):
+        return None
+    return PassthroughSpec(
+        layer_import_mode=LayerImportMode.NEW_LAYERS,
+        layer_source=LayerSource.COLORS,
+        color_attr=color_attr_from_value(args.get("color_from", "any")),
+    )
+
+
 @tool(
     "import_svg",
     "Import SVG markup as new workpiece(s) on the active (or given) "
     'layer. Give the <svg> real-world size, e.g. width="50mm" '
-    'height="30mm" with a matching viewBox. Optionally place/resize.',
+    'height="30mm" with a matching viewBox. Optionally place/resize, or '
+    "split it into one layer per colour.",
     {
         "svg": {"type": "string", "description": "Complete SVG document."},
         "name": {"type": "string", "description": "Name for the import."},
         **PLACEMENT_ARGS,
+        **SPLIT_ARGS,
     },
     required=("svg",),
 )
@@ -1251,7 +1667,7 @@ def t_import_svg(args):
     folder.mkdir(parents=True, exist_ok=True)
     path = folder / f"{stem or 'import'}.svg"
     path.write_text(svg, encoding="utf-8")
-    result = import_path(path, "image/svg+xml", args)
+    result = import_path(path, "image/svg+xml", args, import_spec(args))
     if args.get("name") and len(result["imported"]) == 1:
         item = result["imported"][0]
         if item["name"] != name:
@@ -1268,10 +1684,12 @@ def t_import_svg(args):
 @tool(
     "import_file",
     "Import a file from this computer (SVG, DXF, PDF, PNG, JPG, ...) as "
-    "new workpiece(s). Optionally place/resize.",
+    "new workpiece(s). Optionally place/resize; SVGs can be split into "
+    "one layer per colour.",
     {
         "path": {"type": "string", "description": "Absolute file path."},
         **PLACEMENT_ARGS,
+        **SPLIT_ARGS,
     },
     required=("path",),
 )
@@ -1280,15 +1698,23 @@ def t_import_file(args):
     if not path.is_file():
         raise ToolError(f"File not found: {path}")
     mime_type, _ = mimetypes.guess_type(str(path))
-    return import_path(path, mime_type, args)
+    if args.get("split_by_color") and mime_type != "image/svg+xml":
+        raise ToolError("split_by_color works for SVG files only.")
+    return import_path(path, mime_type, args, import_spec(args))
 
 
 @tool(
     "set_workpiece",
-    "Move, resize or rotate workpieces. x/y/width/height refer to the cut "
-    "geometry in mm (see get_document). Only the given fields change.",
+    "Move, resize or rotate workpieces, or move them to another layer. "
+    "x/y/width/height refer to the cut geometry in mm (see get_document). "
+    "Only the given fields change.",
     {
         "workpieces": WORKPIECES_ARG,
+        "layer": {
+            **LAYER_ARG,
+            "description": "Move the workpieces to this layer (index, name "
+            "or uid).",
+        },
         "x": NUMBER,
         "y": NUMBER,
         "width": NUMBER,
@@ -1301,8 +1727,19 @@ def t_import_file(args):
 def t_set_workpiece(args):
     def run():
         items = find_workpieces(args["workpieces"])
+        if args.get("layer") is not None:
+            target = find_layer(args["layer"])
+            moving = [wp for wp in items if wp.layer is not target]
+            if moving:
+                editor().layer.move_items_to_layer(moving, target)
         apply_placement(items, args)
-        return [describe_workpiece(wp) for wp in items]
+        return [
+            {
+                **describe_workpiece(wp),
+                "layer": getattr(wp.layer, "name", None),
+            }
+            for wp in items
+        ]
 
     result = on_main(run)
     editor().wait_until_settled_sync(timeout=30.0)
@@ -1379,13 +1816,17 @@ def t_redo(args):
 @tool(
     "estimate_job",
     "Generate the toolpath for the whole document and return the "
-    "estimated run time, distances, bounding boxes and Rayforge's "
-    "sanity-check warnings (out of bounds, no-go zones).",
+    "estimated run time (total and per layer), distances, bounding boxes "
+    "and Rayforge's sanity-check warnings (out of bounds, no-go zones).",
     read_only=True,
 )
 def t_estimate_job(args):
     job = fetch_job()
     summary = job_summary(job)
+    try:
+        summary["by_layer"] = time_by_layer(job["ops"])
+    except Exception:  # noqa: BLE001 - optional breakdown
+        logger.exception("Per-layer time estimate failed")
     summary["sanity_issues"] = sanity_issues(job["ops"])
     summary["steps"] = on_main(summarize_steps_for_humans).splitlines()
     return summary
@@ -1464,6 +1905,94 @@ def t_save_project(args):
         return {"saved_to": str(target)}
 
     return on_main(run)
+
+
+DISCARD_ARG = {
+    "type": "boolean",
+    "default": False,
+    "description": "If the open document has unsaved changes, ask the "
+    "user in Rayforge whether to discard them.",
+}
+
+
+def replace_document(args, action, replace):
+    """Run replace() on the main thread, guarding unsaved changes."""
+
+    def state():
+        has_content = any(True for _ in doc().all_workpieces)
+        return editor().is_saved or not has_content, editor().file_path
+
+    saved, current = on_main(state)
+    if not saved:
+        if not args.get("discard_unsaved"):
+            raise ToolError(
+                "The open document has unsaved changes. Save it with "
+                "save_project, or pass discard_unsaved=true to let the user "
+                "decide in Rayforge."
+            )
+        confirm(
+            "Discard unsaved changes?",
+            f"An AI assistant wants to {action}. The open document "
+            f"({Path(current).name if current else 'not saved yet'}) has "
+            "unsaved changes that will be lost.",
+            footer="",
+            unchanged="The document was not changed.",
+        )
+    result = on_main(replace)
+    editor().wait_until_settled_sync(timeout=60.0)
+    return result
+
+
+@tool(
+    "new_document",
+    "Close the open document and start an empty one. Refuses if there "
+    "are unsaved changes unless discard_unsaved is true (the user then "
+    "confirms in Rayforge).",
+    {"discard_unsaved": DISCARD_ARG},
+    destructive=True,
+)
+def t_new_document(args):
+    def replace():
+        project_cmd = win.project_cmd
+        project_cmd._do_create_new_project()
+        return {"created": True, "layers": [x.name for x in doc().layers]}
+
+    return replace_document(args, "start a new document", replace)
+
+
+@tool(
+    "open_project",
+    "Open a Rayforge project (.ryp), replacing the open document. Refuses "
+    "if there are unsaved changes unless discard_unsaved is true (the "
+    "user then confirms in Rayforge).",
+    {
+        "path": {"type": "string", "description": "Path of the .ryp file."},
+        "discard_unsaved": DISCARD_ARG,
+    },
+    required=("path",),
+    destructive=True,
+)
+def t_open_project(args):
+    path = Path(args["path"]).expanduser().resolve()
+    if not path.is_file():
+        raise ToolError(f"File not found: {path}")
+    if path.suffix.lower() != ".ryp":
+        raise ToolError(
+            "open_project opens .ryp projects; use import_file for designs."
+        )
+
+    def replace():
+        win.project_cmd.load_project(path)
+        opened = editor().file_path
+        if not opened or Path(opened).resolve() != path:
+            raise ToolError(
+                "Rayforge could not open the project; see its notification."
+            )
+        return {"opened": str(path)}
+
+    result = replace_document(args, f"open {path.name}", replace)
+    result.update(t_get_document({}))
+    return result
 
 
 # --- Machine tools ------------------------------------------------------
@@ -1732,24 +2261,155 @@ def t_machine_resume(args):
     return on_main(run)
 
 
+def machine_snapshot(m):
+    return {
+        "status": getattr(
+            m.device_state.status, "name", m.device_state.status
+        ),
+        "connection": getattr(
+            m.connection_status, "name", m.connection_status
+        ),
+        "error": m.device_state.error,
+        "position": position_text(m),
+    }
+
+
+def run_machine_task(m, make_coro, key, timeout):
+    """
+    Run a machine coroutine through Rayforge's task manager and wait for
+    it. Returns (finished, outcome) where outcome has the task's final
+    status and, if it failed, the error.
+    """
+    done = threading.Event()
+    outcome = {}
+
+    def when_done(task):
+        outcome["status"] = task.get_status()
+        try:
+            task.result()
+        except BaseException as e:  # noqa: BLE001 - reported to the client
+            outcome["error"] = f"{type(e).__name__}: {e}".rstrip(": ")
+        done.set()
+
+    on_main(
+        lambda: editor().task_manager.add_coroutine(
+            lambda ctx: make_coro(), key=key, when_done=when_done
+        )
+    )
+    return done.wait(timeout), outcome
+
+
 @tool(
     "machine_home",
-    "Home the machine. Needs the operator's approval in Rayforge.",
+    "Home the machine and wait until Rayforge reports how it ended (or "
+    "until 'timeout' seconds pass). Needs the operator's approval in "
+    "Rayforge.",
+    {
+        "timeout": {
+            "type": "number",
+            "default": 180,
+            "description": "Seconds to wait for homing to finish (10-600).",
+        }
+    },
     destructive=True,
     machine_control=True,
 )
 def t_machine_home(args):
+    timeout = min(max(float(args.get("timeout") or 180), 10.0), 600.0)
+
     def check():
-        m = require_machine()
+        m = require_machine(states=HOME_STATES)
         if not m.can_home():
             raise ToolError("This machine cannot home.")
         window_action("machine-home")
-        return m.name
+        return m
 
-    name = on_main(check)
-    confirm("Home the machine?", f"Machine: {name}\nAll axes will move.")
-    on_main(lambda: window_action("machine-home").activate(None))
-    return {"homing": True}
+    m = on_main(check)
+    confirm("Home the machine?", f"Machine: {m.name}\nAll axes will move.")
+
+    def start():
+        require_machine(states=HOME_STATES)
+        # As Rayforge's Home button does: leave focus mode first.
+        focus = win.action_manager.get_action("toggle-focus")
+        state = focus.get_state() if focus else None
+        if state and state.get_boolean():
+            focus.change_state(GLib.Variant.new_boolean(False))
+
+    on_main(start)
+    started = time.monotonic()
+    finished, outcome = run_machine_task(
+        m, lambda: m.home(), "mcp-machine-home", timeout
+    )
+    result = on_main(lambda: machine_snapshot(m))
+    gave_up = finished and "TimeoutError" in str(outcome.get("error"))
+    if gave_up:
+        # Rayforge stops waiting after a fixed time (10 s in 1.13), which
+        # is too short for large machines. Follow the controller instead.
+        while (
+            result["status"] == "HOME"
+            and result["connection"] == "CONNECTED"
+            and time.monotonic() - started < timeout
+        ):
+            time.sleep(0.5)
+            result = on_main(lambda: machine_snapshot(m))
+    if finished and result["status"] not in READY_STATES + ("HOME",):
+        # Rayforge sends a few setup commands after homing; give the
+        # controller a moment to settle so the next action is not refused.
+        settle = time.monotonic() + 3.0
+        while (
+            result["status"] not in READY_STATES + ("ALARM",)
+            and time.monotonic() < settle
+        ):
+            time.sleep(0.25)
+            result = on_main(lambda: machine_snapshot(m))
+    result["seconds"] = rnd(time.monotonic() - started, 1)
+    if gave_up and result["connection"] == "CONNECTED":
+        result["rayforge_error"] = outcome["error"]
+        if result["status"] in READY_STATES:
+            result["homed"] = True
+            result["note"] = (
+                "Rayforge stopped waiting for homing early, but the "
+                f"controller finished after {result['seconds']} s and is "
+                "idle."
+            )
+        elif result["status"] == "HOME":
+            result["homed"] = False
+            result["note"] = (
+                "Rayforge stopped waiting for homing early and the "
+                f"controller is still homing after {result['seconds']} s. "
+                "Check machine_status until it is IDLE before the next move."
+            )
+        else:
+            result["homed"] = False
+            result["note"] = (
+                "Rayforge stopped waiting for homing early; the controller "
+                f"is now {result['status']}. Ask the user what the machine "
+                "did."
+            )
+    elif not finished:
+        result["homed"] = None
+        result["note"] = (
+            f"Rayforge has not reported the end of homing after "
+            f"{timeout:.0f}s. Check machine_status; use machine_stop if "
+            "something looks wrong."
+        )
+    elif outcome.get("status") != "completed" or "error" in outcome:
+        result["homed"] = False
+        result["rayforge_error"] = outcome.get("error") or outcome.get(
+            "status"
+        )
+        result["note"] = (
+            "Rayforge reported that homing failed. On large machines this "
+            "can be Rayforge giving up waiting while the machine is still "
+            "homing; then the connection may need to be reconnected in "
+            "Rayforge. Ask the user what the machine did."
+        )
+    elif result["status"] == "ALARM":
+        result["homed"] = False
+        result["note"] = "The controller is in ALARM after homing."
+    else:
+        result["homed"] = True
+    return result
 
 
 @tool(
@@ -1815,14 +2475,16 @@ def t_machine_frame(args):
         m = machine()
         head = m.get_default_laser_head()
         power = getattr(head, "frame_power_percent", 0) or 0
-        return m.name, power
+        return m.name, power, summarize_steps_for_humans(), end_move_text(m)
 
-    name, frame_power = on_main(details)
+    name, frame_power, steps_text, end_move = on_main(details)
     bbox = summary.get("burn_bbox_mm") or summary.get("bbox_mm")
     confirm(
         "Frame the job outline?",
         f"Machine: {name}\nOutline (mm): {bbox}\n"
-        f"Frame laser power: {float(frame_power) * 100:.0f}%",
+        f"Frame laser power: {float(frame_power) * 100:.0f}%\n"
+        f"Steps included:\n{steps_text}"
+        + (f"\n\n{end_move}" if end_move else ""),
     )
 
     def run():
@@ -1847,7 +2509,9 @@ def t_machine_start_job(args):
     summary = job_summary(job)
     issues = sanity_issues(job["ops"])
     steps_text = on_main(summarize_steps_for_humans)
-    name = on_main(lambda: machine().name)
+    name, end_move = on_main(
+        lambda: (machine().name, end_move_text(machine()))
+    )
     warn = ""
     if issues:
         warn = "\n\nSanity check:\n" + "\n".join(
@@ -1858,7 +2522,8 @@ def t_machine_start_job(args):
         f"Machine: {name}\n"
         f"Estimated time: {summary['estimated_time']}\n"
         f"Burn area (mm): {summary.get('burn_bbox_mm')}\n"
-        f"Steps:\n{steps_text}{warn}",
+        f"Steps:\n{steps_text}{warn}"
+        + (f"\n\n{end_move}" if end_move else ""),
     )
     on_main(lambda: window_action("machine-send").activate(None))
     notify("AI assistant started the job (approved by operator)")

@@ -4,4 +4,4 @@ assistants over the Model Context Protocol (Streamable HTTP).
 """
 
 ADDON_NAME = "mcp_bridge"
-VERSION = "0.3.1"
+VERSION = "0.4.0"

@@ -12,6 +12,7 @@ If an access token is set, the test cannot connect; clear it first.
 
 import base64
 import json
+import os
 import sys
 import urllib.request
 
@@ -267,6 +268,190 @@ if not err:
 
 err, undo, texts, _ = call("undo")
 check("undo", not err, undo.get("undone") if not err else texts[0])
+
+# --- Speed limits and choice settings --------------------------------
+machine_info = docinfo["machine"]
+max_travel = machine_info["max_travel_speed"]
+max_cut = machine_info["max_cut_speed"]
+check(
+    "get_document reports the active WCS",
+    "active" in (machine_info.get("work_coordinates") or {}),
+    machine_info.get("work_coordinates"),
+)
+err, _, texts, _ = call(
+    "set_step_settings",
+    layer=0,
+    step=0,
+    settings={"travel_speed": max_travel + 1000},
+)
+check("rejects travel_speed above the machine max", err, texts[0][:120])
+
+err, raster, texts, _ = call("add_step", layer=0, step_type="Raster")
+check(
+    "add_step keeps speeds within the machine's limits",
+    not err
+    and raster["settings"]["travel_speed"] <= max_travel
+    and raster["settings"]["cut_speed"] <= max_cut,
+    texts[0][:200]
+    if err
+    else f"{raster['settings']['cut_speed']}/"
+    f"{raster['settings']['travel_speed']}, "
+    f"adjusted {raster.get('speeds_limited_to_machine')}",
+)
+for value, expected in (
+    ("Constant Power", "CONSTANT_POWER"),
+    ("dither", "DITHER"),
+    ("POWER_MODULATION", "POWER_MODULATION"),
+):
+    err, step, texts, _ = call(
+        "set_step_settings",
+        layer=0,
+        step=raster["index"] if raster else 1,
+        settings={"depth_mode": value},
+    )
+    check(
+        f"depth_mode accepts {value!r}",
+        not err and step["settings"]["depth_mode"] == expected,
+        texts[0][:160],
+    )
+err, _, texts, _ = call(
+    "set_step_settings",
+    layer=0,
+    step=raster["index"] if raster else 1,
+    settings={"depth_mode": "laser beams"},
+)
+check("depth_mode rejects unknown choices", err, texts[0][:160])
+err, _, texts, _ = call(
+    "remove_step", layer=0, step=raster["index"] if raster else 1
+)
+check("remove_step", not err, texts[0][:120])
+
+# Offset Fill can hang Rayforge on some shapes, so only try it on a
+# layer without workpieces (nothing gets computed there).
+err, scratch, texts, _ = call("add_layer", name="Offset Fill check")
+err, fill, texts, _ = call(
+    "add_step", layer=scratch["uid"], step_type="Offset Fill"
+)
+check(
+    "Offset Fill steps carry a freeze warning",
+    not err and any("freeze" in w for w in fill.get("warnings", [])),
+    texts[0][:160] if err else fill.get("warnings"),
+)
+call("remove_layer", layer=scratch["uid"])
+
+# --- Colour split, layers, per-layer time ----------------------------
+COLOR_SVG = """<svg xmlns="http://www.w3.org/2000/svg" width="40mm"
+     height="20mm" viewBox="0 0 40 20">
+  <rect x="0" y="0" width="18" height="20" fill="none" stroke="#ff0000"/>
+  <circle cx="30" cy="10" r="10" fill="none" stroke="#000000"/>
+</svg>"""
+err, split, texts, _ = call(
+    "import_svg", svg=COLOR_SVG, split_by_color=True, x=150, y=100
+)
+new_layers = split.get("new_layers", []) if not err else []
+check(
+    "import_svg split_by_color makes a layer per colour",
+    not err and len(new_layers) == 2 and len(split["imported"]) == 2,
+    texts[0][:300] if err else [layer["name"] for layer in new_layers],
+)
+if not err and len(split["imported"]) == 2:
+    xs = sorted((w["x"], w["y"]) for w in split["imported"])
+    check(
+        "split import placed as one design (layout kept)",
+        close(xs[0][0], 150)
+        and close(xs[0][1], 100)
+        and close(xs[1][0], 170)
+        and close(xs[1][1], 100),
+        xs,
+    )
+    for layer in new_layers:
+        for s in layer["steps"]:
+            check(
+                f"default step on {layer['name']} within limits",
+                s["settings"].get("travel_speed", 0) <= max_travel,
+                s["settings"].get("travel_speed"),
+            )
+
+if len(new_layers) == 2:
+    red, black = new_layers
+    err, upd, texts, _ = call(
+        "update_layer", layer=red["uid"], name="Cut", index=0, visible=False
+    )
+    check(
+        "update_layer renames, moves and hides in one call",
+        not err
+        and upd["name"] == "Cut"
+        and upd["index"] == 0
+        and upd["visible"] is False,
+        texts[0][:200],
+    )
+    err, undo, texts, _ = call("undo")
+    _e, d, _t, _i = call("get_document")
+    names = [layer["name"] for layer in d["layers"]]
+    check(
+        "one undo reverts update_layer",
+        not err and "Cut" not in names and red["name"] in names,
+        names,
+    )
+    call("redo")
+
+    err, est, texts, _ = call("estimate_job")
+    by_layer = (
+        {e["layer"]: e for e in est.get("by_layer", [])} if not err else {}
+    )
+    check(
+        "estimate_job splits time by layer, hidden layer still included",
+        "Cut" in by_layer
+        and close(
+            sum(e["seconds"] for e in by_layer.values()),
+            est["estimated_seconds"],
+            0.5,
+        ),
+        {k: v["seconds"] for k, v in by_layer.items()},
+    )
+    err, upd, texts, _ = call("update_layer", layer="Cut", enabled=False)
+    err2, est2, _t, _i = call("estimate_job")
+    check(
+        "disabled layer leaves the job",
+        not err
+        and not err2
+        and "Cut" not in {e["layer"] for e in est2.get("by_layer", [])}
+        and est2["estimated_seconds"] < est["estimated_seconds"],
+        f"{est['estimated_seconds']} -> {est2.get('estimated_seconds')}",
+    )
+    call("update_layer", layer="Cut", enabled=True)
+
+    circle = [w for w in split["imported"] if w["width"] > 19][0]
+    err, moved, texts, _ = call(
+        "set_workpiece", workpieces=[circle["uid"]], layer="Cut"
+    )
+    check(
+        "set_workpiece moves a workpiece to another layer",
+        not err and moved[0]["layer"] == "Cut",
+        texts[0][:160],
+    )
+    err, gone, texts, _ = call("remove_layer", layer=black["uid"])
+    check("remove_layer", not err, texts[0][:160])
+
+# --- Documents -------------------------------------------------------
+err, _, texts, _ = call("new_document")
+check("new_document refuses unsaved changes", err, texts[0][:160])
+project = os.path.abspath(PREVIEW.rsplit(".", 1)[0] + "-smoke.ryp")
+err, saved, texts, _ = call("save_project", path=project)
+check("save_project", not err, texts[0][:160])
+err, new, texts, _ = call("new_document")
+_e, d, _t, _i = call("get_document")
+check(
+    "new_document after saving gives an empty document",
+    not err and not any(layer["workpieces"] for layer in d["layers"]),
+    texts[0][:160],
+)
+err, opened, texts, _ = call("open_project", path=project)
+check(
+    "open_project reopens the saved project",
+    not err and any(layer["workpieces"] for layer in opened["layers"]),
+    texts[0][:160],
+)
 
 err, ms, texts, _ = call("machine_status")
 check("machine_status", not err, texts[0][:300])
