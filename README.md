@@ -93,6 +93,9 @@ and the text HELLO, cut at 80% / 400 mm/min, and show me the preview."*
 | `machine_info` | Machine setup plus the controller's own settings (GRBL `$$`), with checks such as laser mode `$32` and max power `$30` | never |
 | `machine_status`, `machine_pause`, `machine_stop` | State/position/progress; feed hold; cancel | never |
 | `machine_start_job`, `machine_frame`, `machine_home`, `machine_jog`, `machine_resume`, `machine_clear_alarm` | Moves the head or fires the laser | **Allow in Rayforge** |
+| `machine_send_command` | One console line; returns the reply (`ok` / `error:N` with its meaning) | **Allow in Rayforge**, except read-only queries (`$$`, `$#`, `$G`, `$I`, `$N`, `$`) |
+| `set_controller_setting` | Writes `$N=value` while idle, then reads `$$` back to confirm | **Allow in Rayforge** |
+| `set_machine_settings` | Rayforge's machine profile: max cut/travel speed, acceleration, jog speed, frame speed/power, laser max S value | **Allow in Rayforge** |
 
 Design edits use Rayforge's own undoable commands, so they show up live
 and `Ctrl+Z` works.
@@ -121,6 +124,13 @@ as `frame`. Placing a 60×40 mm design at x=20 puts the cut at x=20.
   `machine_status` never wait, even while a dialog is open.
 - Motion commands are refused while the controller is busy (homing,
   running, jogging); homing is also allowed from ALARM.
+- Console lines, controller settings and machine-profile changes also
+  need Allow. The dialog shows the following:
+  - for a console line: the exact line, and what it does (moves the
+    head, turns the laser on, changes a setting…)
+  - for a setting or profile change: the current and the new values
+- Only one line is sent per console call, and real-time characters are
+  refused.
 - The frame and job dialogs list the steps that will run and say
   where the head goes at the end (Rayforge's `G0 X0 Y0` in the
   active work coordinate system).
@@ -167,7 +177,7 @@ headless:
   v0.2.0 server and took over the port in 0.6 s; reinstalling v0.3.1
   handed over cleanly; after uninstall the port closed on its own in
   0.4 s.
-- **Design tools (smoke test, 53 checks):** G-code carried the set power
+- **Design tools (smoke test, 56 checks):** G-code carried the set power
   and speed; passes scaled cut length exactly; imported geometry lands
   exactly at the requested x/y and size; one undo reverts a whole
   settings call. Since 0.4.0 it also covers the following:
@@ -189,6 +199,18 @@ headless:
   followed the controller and reported success after 15.5 s. With a
   12 s limit it reported "still homing", and frame and jog were refused
   until the controller was idle.
+- **Console and settings tools (22 checks)** against the fake GRBL:
+  - `$$` and `$G` ran without a dialog. A denied `G0` sent nothing.
+  - An approved bad command came back as `error:3` with its meaning.
+    Real-time characters and multi-line input were refused.
+  - `$110` went 3000 → 1000 and was confirmed by reading `$$` back.
+    Writing the same value again opened no dialog. A denied `$111`
+    stayed unchanged.
+  - After the change, `machine_info` warned that Rayforge's speeds were
+    above `$110`/`$111`.
+  - `set_machine_settings` changed max speeds and frame power/speed
+    after Allow. Rayforge saved them in the machine file, and steps
+    above the new limits were listed.
 - **Real hardware (0.3.1):** TwoTrees TTC-H40 (grblHAL, 20 W diode).
   Tested `machine_info`, home, jog, frame, and a 10–100 % power-test
   job.
@@ -223,6 +245,14 @@ headless:
     ended. If Rayforge stops waiting early (its limit is 10 s), the
     tool keeps watching the controller.
   - Motion commands are refused while the controller is busy.
+  - New controller tools (each needs Allow):
+    - `machine_send_command`: one console line with its reply;
+      read-only queries need no approval
+    - `set_controller_setting`: `$N=value`, confirmed by reading `$$`
+      back
+    - `set_machine_settings`: Rayforge's machine profile
+  - `machine_info` warns when Rayforge's max speeds are above the
+    controller's `$110`/`$111`, and shows jog and frame speed.
   - The approval dialogs now do the following:
     - list steps on hidden layers, which still burn
     - say where the head goes at the end

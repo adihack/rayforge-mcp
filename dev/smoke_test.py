@@ -473,6 +473,13 @@ for name in ("machine_home", "machine_start_job", "machine_frame"):
 err, _, texts, _ = call("machine_jog", dx=0, dy=0)
 check("machine_jog rejects zero move", err, texts[0][:120])
 
+err, _, texts, _ = call("machine_send_command", line="$$")
+check("machine_send_command refused without a real machine", err, texts[0])
+err, _, texts, _ = call("set_controller_setting", key=110, value=1000)
+check("set_controller_setting refused without a real machine", err, texts[0])
+err, _, texts, _ = call("set_machine_settings", settings={"frame_power": 5})
+check("set_machine_settings validates before asking", err, texts[0])
+
 try:
     rpc("tools/call", {"name": "no_such_tool", "arguments": {}})
     check("unknown tool -> JSON-RPC error", False)

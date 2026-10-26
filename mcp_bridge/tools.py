@@ -454,17 +454,16 @@ def labeled_choices(var):
 
 
 def speed_limits(step=None):
-    """Max cut/travel speed (mm/min): the machine's, or the step's if lower."""
+    """
+    Max cut/travel speed (mm/min) from the machine profile. Steps keep a
+    copy from when they were created, used only without a machine.
+    """
     m = machine()
-    limits = {}
-    for key in SPEED_KEYS:
-        caps = [
-            getattr(m, f"max_{key}", None) if m else None,
-            getattr(step, f"max_{key}", None) if step else None,
-        ]
-        caps = [c for c in caps if c]
-        limits[key] = min(caps) if caps else None
-    return limits
+    source = m if m is not None else step
+    return {
+        key: getattr(source, f"max_{key}", None) if source else None
+        for key in SPEED_KEYS
+    }
 
 
 def clamp_new_step_speeds(step):
@@ -819,6 +818,7 @@ CONFIRM_FOOTER = (
     "are at the machine, the material and lid are ready, and you can "
     "stop it."
 )
+SETTINGS_FOOTER = "\n\nRequested by an AI assistant over MCP."
 
 
 def confirm(
@@ -1935,7 +1935,7 @@ def replace_document(args, action, replace):
             f"An AI assistant wants to {action}. The open document "
             f"({Path(current).name if current else 'not saved yet'}) has "
             "unsaved changes that will be lost.",
-            footer="",
+            footer=SETTINGS_FOOTER,
             unchanged="The document was not changed.",
         )
     result = on_main(replace)
@@ -2115,6 +2115,24 @@ def grbl_checks(firmware, m):
                 "the head's max power to match $30.",
             }
         )
+    rates = [as_number(firmware.get(k)) for k in ("110", "111")]
+    rates = [r for r in rates if r]
+    if rates:
+        limit = min(rates)
+        for name, value in (
+            ("max cut speed", m.max_cut_speed),
+            ("max travel speed", m.max_travel_speed),
+        ):
+            if value and value > limit + 0.5:
+                checks.append(
+                    {
+                        "level": "warning",
+                        "message": f"Rayforge's {name} is {value} mm/min "
+                        f"but the controller limits X/Y to {limit:g} mm/min "
+                        "($110/$111). Moves run slower than Rayforge "
+                        "plans, so its time estimates are too short.",
+                    }
+                )
     for key, extent, axis in (
         ("130", m.axis_extents[0], "X"),
         ("131", m.axis_extents[1], "Y"),
@@ -2168,6 +2186,7 @@ def t_machine_info(args):
                 "optical_power_w": getattr(head, "max_power_watts", None),
                 "wavelength_nm": getattr(head, "wavelength_nm", None),
                 "frame_power": getattr(head, "frame_power_percent", None),
+                "frame_speed": getattr(head, "frame_speed", None),
                 "focus_power": getattr(head, "focus_power_percent", None),
             }
             for head in m.heads
@@ -2180,6 +2199,7 @@ def t_machine_info(args):
             "laser_on_command": getattr(dialect, "laser_on", None),
             "origin": origin,
             "acceleration": getattr(m, "acceleration", None),
+            "jog_speed": getattr(m, "jog_speed", None),
             "heads": heads,
         }
         can_read = (
@@ -2278,7 +2298,7 @@ def run_machine_task(m, make_coro, key, timeout):
     """
     Run a machine coroutine through Rayforge's task manager and wait for
     it. Returns (finished, outcome) where outcome has the task's final
-    status and, if it failed, the error.
+    status and either its result or the error.
     """
     done = threading.Event()
     outcome = {}
@@ -2286,7 +2306,7 @@ def run_machine_task(m, make_coro, key, timeout):
     def when_done(task):
         outcome["status"] = task.get_status()
         try:
-            task.result()
+            outcome["result"] = task.result()
         except BaseException as e:  # noqa: BLE001 - reported to the client
             outcome["error"] = f"{type(e).__name__}: {e}".rstrip(": ")
         done.set()
@@ -2556,3 +2576,419 @@ def t_machine_clear_alarm(args):
     )
     on_main(lambda: window_action("machine-clear-alarm").activate(None))
     return {"cleared": True}
+
+
+# --- Controller console and settings ------------------------------------
+
+# GRBL/grblHAL commands that only report; they need no approval.
+READ_ONLY_COMMANDS = {
+    "$",
+    "$$",
+    "$#",
+    "$G",
+    "$I",
+    "$N",
+    "$ES",
+    "$EG",
+    "$EA",
+    "$EE",
+}
+COMMAND_EFFECTS = (
+    (r"^\$H", "homes the machine (axes move)"),
+    (r"^\$J=", "jogs the head"),
+    (r"^\$X", "unlocks the controller without homing"),
+    (r"^\$RST", "RESETS controller settings or offsets (cannot be undone)"),
+    (r"^\$\d+=", "changes a stored controller setting"),
+    (r"^\$N\d+=", "changes a startup line run at every reset"),
+    (r"^\$SLP", "puts the controller to sleep"),
+    (r"^\$C$", "toggles check mode"),
+    (r"(^|[^A-Z])G0*[0-3](?!\d)", "moves the head"),
+    (r"(^|[^A-Z])G(28|30|38)", "moves the head"),
+    (r"(^|[^A-Z])M0*[34](?!\d)", "TURNS THE LASER ON"),
+    (r"(^|[^A-Z])G(10|92)(?!\d)", "changes work coordinates"),
+)
+
+
+def grbl_driver(m):
+    if "Grbl" not in (m.driver_name or ""):
+        raise ToolError(
+            f"This tool works with GRBL controllers; this machine uses "
+            f"{m.driver_name or 'no driver'}."
+        )
+
+
+def explain_reply(lines):
+    """Translate error:N / ALARM:N lines with Rayforge's GRBL tables."""
+    try:
+        from rayforge.machine.driver.grbl.grbl_util import (
+            GRBL_ALARM_CODES,
+            GRBL_ERROR_CODES,
+        )
+    except ImportError:
+        return None
+    for line in lines:
+        found = re.match(r"(error|ALARM):(\d+)", line.strip(), re.IGNORECASE)
+        if not found:
+            continue
+        table = GRBL_ERROR_CODES if found[1] == "error" else GRBL_ALARM_CODES
+        entry = table.get(int(found[2]))
+        if entry is None:
+            return None
+        parts = [
+            str(getattr(entry, attr, "") or "")
+            for attr in ("title", "description")
+        ]
+        return " - ".join(p for p in parts if p) or str(entry)
+    return None
+
+
+@tool(
+    "machine_send_command",
+    "Send one line to the controller, as in Rayforge's Console, and "
+    "return its reply (ok / error:N with its meaning). Read-only queries "
+    "($$, $#, $G, $I, $N, $) run right away; anything else needs the "
+    "operator's approval in Rayforge. Use set_controller_setting to "
+    "change $N settings, and the machine_* tools for homing and jogging.",
+    {
+        "line": {"type": "string", "description": "One command line."},
+        "timeout": {
+            "type": "number",
+            "default": 30,
+            "description": "Seconds to wait for the reply (5-300).",
+        },
+    },
+    required=("line",),
+    destructive=True,
+    machine_control=True,
+)
+def t_machine_send_command(args):
+    line = str(args.get("line") or "").strip()
+    timeout = min(max(float(args.get("timeout") or 30), 5.0), 300.0)
+    if not line:
+        raise ToolError("Give a command line.")
+    if len(line) > 256 or not all(" " <= ch <= "~" for ch in line):
+        raise ToolError(
+            "Send one printable ASCII line (no line breaks or control "
+            "characters, at most 256 characters)."
+        )
+    if line in ("?", "!", "~"):
+        raise ToolError(
+            "Real-time commands are not sent this way: use machine_status, "
+            "machine_pause or machine_resume."
+        )
+    code = re.sub(r"\(.*?\)|;.*$", "", line).strip().upper().replace(" ", "")
+    read_only = code in READ_ONLY_COMMANDS
+
+    def check():
+        m = require_machine(states=HOME_STATES)
+        grbl_driver(m)
+        return m
+
+    m = on_main(check)
+    if not read_only:
+        effects = sorted(
+            {
+                text
+                for pattern, text in COMMAND_EFFECTS
+                if re.search(pattern, code)
+            }
+        )
+        what = (
+            "\n".join(f"  - {e}" for e in effects)
+            if effects
+            else "  - effect not recognised; check the command yourself"
+        )
+        confirm(
+            "Send a command to the controller?",
+            f"Machine: {m.name}\nCommand: {line}\nThis command:\n{what}",
+        )
+        on_main(lambda: require_machine(states=HOME_STATES))
+    finished, outcome = run_machine_task(
+        m,
+        lambda: m.driver.execute_interactive_command(line),
+        "mcp-console-command",
+        timeout,
+    )
+    if not finished:
+        raise ToolError(
+            f"No reply within {timeout:.0f}s. The command may still be "
+            "running; check machine_status."
+        )
+    if "error" in outcome:
+        raise ToolError(f"Rayforge could not send it: {outcome['error']}")
+    reply = [str(r) for r in (outcome.get("result") or [])]
+    result = {
+        "sent": line,
+        "reply": reply,
+        "ok": any(r.strip().lower() == "ok" for r in reply)
+        and not any(r.strip().lower().startswith("error") for r in reply),
+        "approved": not read_only,
+    }
+    meaning = explain_reply(reply)
+    if meaning:
+        result["meaning"] = meaning
+    if not read_only:
+        notify(f"AI assistant sent '{line}' (approved by operator)")
+    return result
+
+
+def setting_number(value):
+    """A controller setting value as GRBL text, numbers only."""
+    if isinstance(value, bool):
+        return "1" if value else "0"
+    if isinstance(value, int):
+        return str(value)
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise ToolError("value must be a finite number.")
+        text = f"{value:.6f}".rstrip("0").rstrip(".")
+        return text or "0"
+    text = str(value).strip()
+    if not re.fullmatch(r"-?\d+(\.\d+)?", text):
+        raise ToolError(
+            "value must be a number. For text settings use "
+            "machine_send_command."
+        )
+    return text
+
+
+def plain_number(value):
+    """3000.0 -> 3000 for display; other values unchanged."""
+    if isinstance(value, float) and value.is_integer():
+        return int(value)
+    return value
+
+
+def same_number(a, b):
+    try:
+        return abs(float(a) - float(b)) < 1e-9
+    except (TypeError, ValueError):
+        return str(a).strip() == str(b).strip()
+
+
+SENSITIVE_SETTINGS = {
+    "30": "the S value for full laser power; must match the head's max "
+    "power in Rayforge",
+    "32": "laser mode; with 0, GRBL keeps the laser on during moves",
+    "20": "soft limits",
+    "21": "hard limits",
+    "22": "homing",
+    "100": "X steps/mm; wrong values scale every move",
+    "101": "Y steps/mm; wrong values scale every move",
+    "102": "Z steps/mm; wrong values scale every move",
+}
+
+
+@tool(
+    "set_controller_setting",
+    "Change one controller setting ($N=value on GRBL), e.g. key 110, "
+    "value 1000 (X max rate, mm/min). Only while connected and idle. "
+    "Reads the current value, asks the operator to Allow in Rayforge, "
+    "writes it, then reads $$ back to confirm. Numbers only.",
+    {
+        "key": {
+            "type": ["integer", "string"],
+            "description": 'Setting number, e.g. 110 or "$110".',
+        },
+        "value": {"type": ["number", "string"]},
+    },
+    required=("key", "value"),
+    destructive=True,
+    machine_control=True,
+)
+def t_set_controller_setting(args):
+    key = str(args["key"]).strip().lstrip("$")
+    if not re.fullmatch(r"\d{1,4}", key):
+        raise ToolError("key must be a setting number such as 110 or $110.")
+    text = setting_number(args["value"])
+
+    def check():
+        m = require_machine()
+        grbl_driver(m)
+        return m
+
+    m = on_main(check)
+    before = read_firmware_settings(m)
+    if key not in before:
+        keys = sorted(before, key=lambda k: (len(k), k))
+        known = ", ".join(f"${k}" for k in keys[:80])
+        raise ToolError(f"The controller has no ${key}. It has: {known}")
+    old = plain_number(before[key])
+    if same_number(old, text):
+        return {"setting": f"${key}", "value": old, "unchanged": True}
+
+    def describe_key():
+        # Rayforge labels GRBL settings "$110" and describes them.
+        for var_set in m.driver.get_setting_vars() or []:
+            for var in var_set:
+                if str(var.key) == key:
+                    return str(var.description or var.label or "")
+        return ""
+
+    label = on_main(describe_key)
+    caution = SENSITIVE_SETTINGS.get(key)
+    confirm(
+        "Change a controller setting?",
+        f"Machine: {m.name}\nSetting: ${key}"
+        + (f" ({label})" if label else "")
+        + f"\nCurrent value: {old}\nNew value: {text}\n\n"
+        "The controller stores this permanently (it stays after a restart)."
+        + (f"\nNote: ${key} is {caution}." if caution else ""),
+        footer=SETTINGS_FOOTER,
+        unchanged="The controller was not changed.",
+    )
+    on_main(require_machine)
+    errors = []
+
+    def on_error(_sender, error=None, **_kwargs):
+        errors.append(str(error))
+
+    on_main(lambda: m.settings_error.connect(on_error, weak=False))
+    try:
+        finished, outcome = run_machine_task(
+            m,
+            lambda: m.controller.write_setting(key, text),
+            "mcp-write-setting",
+            20.0,
+        )
+    finally:
+        on_main(lambda: m.settings_error.disconnect(on_error))
+    if not finished:
+        raise ToolError("The controller did not confirm within 20 s.")
+    if "error" in outcome or errors:
+        raise ToolError(
+            f"Writing ${key} failed: {outcome.get('error') or errors[0]}"
+        )
+    after = plain_number(read_firmware_settings(m).get(key))
+    confirmed = same_number(after, text)
+    notify(f"AI assistant set ${key}={text} (approved by operator)")
+    result = {
+        "setting": f"${key}",
+        "label": label,
+        "before": old,
+        "after": after,
+        "confirmed": confirmed,
+    }
+    if not confirmed:
+        result["note"] = (
+            "The value read back differs from the one written; the "
+            "controller may have rejected or rounded it."
+        )
+    return result
+
+
+MACHINE_SETTINGS = {
+    "max_cut_speed": ("Max cut speed", "mm/min", 1, 100000),
+    "max_travel_speed": ("Max travel speed", "mm/min", 1, 100000),
+    "acceleration": ("Acceleration", "mm/s²", 1, 100000),
+    "jog_speed": ("Jog speed", "mm/min", 1, 100000),
+    "frame_speed": ("Frame speed", "mm/min", 0, 100000),
+    "frame_power": ("Frame power", "fraction of full power", 0.0, 1.0),
+    "laser_max_power": ("Laser max power", "S value (match $30)", 1, 100000),
+}
+HEAD_SETTINGS = {
+    "frame_speed": ("frame_speed", "set_frame_speed"),
+    "frame_power": ("frame_power_percent", "set_frame_power"),
+    "laser_max_power": ("max_power", "set_max_power"),
+}
+
+
+@tool(
+    "set_machine_settings",
+    'Change Rayforge\'s machine profile, e.g. {"max_cut_speed": 1000, '
+    '"frame_power": 0.01}. Keys: max_cut_speed, max_travel_speed, '
+    "jog_speed, frame_speed (mm/min; 0 = max travel speed), acceleration "
+    "(mm/s²), frame_power "
+    "(fraction 0-1), laser_max_power (S value, should match GRBL $30). "
+    "Asks the operator to Allow in Rayforge; Rayforge saves the profile.",
+    {
+        "settings": {
+            "type": "object",
+            "description": "Setting key -> new value.",
+        }
+    },
+    required=("settings",),
+    destructive=True,
+)
+def t_set_machine_settings(args):
+    settings = args.get("settings") or {}
+    if not isinstance(settings, dict) or not settings:
+        raise ToolError("'settings' must be a non-empty object.")
+    planned = {}
+    for key, value in settings.items():
+        if key not in MACHINE_SETTINGS:
+            raise ToolError(
+                f"Unknown machine setting {key!r}. Valid: "
+                f"{sorted(MACHINE_SETTINGS)}"
+            )
+        label, unit, low, high = MACHINE_SETTINGS[key]
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ToolError(f"{key} must be a number.")
+        if not (math.isfinite(value) and low <= value <= high):
+            hint = " (0.01 = 1 %)" if key == "frame_power" else ""
+            raise ToolError(f"{key}={value!r} is outside {low}..{high}{hint}")
+        planned[key] = float(value) if isinstance(low, float) else int(value)
+
+    def current():
+        m = require_machine(connected=False)
+        head = m.get_default_laser_head()
+        values = {}
+        for key in planned:
+            if key in HEAD_SETTINGS:
+                if head is None:
+                    raise ToolError("This machine has no laser head.")
+                values[key] = getattr(head, HEAD_SETTINGS[key][0])
+            else:
+                values[key] = getattr(m, key)
+        return m, values
+
+    m, old = on_main(current)
+    changes = {k: v for k, v in planned.items() if not same_number(old[k], v)}
+    if not changes:
+        return {"unchanged": True, "values": old}
+
+    def fmt(key, value):
+        if key == "frame_power":
+            return f"{float(value) * 100:g} %"
+        return f"{value:g} {MACHINE_SETTINGS[key][1]}"
+
+    lines = "\n".join(
+        f"  - {MACHINE_SETTINGS[k][0]}: {fmt(k, old[k])} -> {fmt(k, v)}"
+        for k, v in changes.items()
+    )
+    confirm(
+        "Change the machine settings?",
+        f"Machine: {m.name}\n{lines}\n\nRayforge saves this in the "
+        "machine profile.",
+        footer=SETTINGS_FOOTER,
+        unchanged="The machine settings were not changed.",
+    )
+
+    def apply():
+        require_machine(connected=False)
+        head = m.get_default_laser_head()
+        for key, value in changes.items():
+            if key in HEAD_SETTINGS:
+                getattr(head, HEAD_SETTINGS[key][1])(value)
+            else:
+                getattr(m, f"set_{key}")(value)
+        over = [
+            f"{layer.name} / {step.name}: {warning}"
+            for layer in doc().layers
+            for step in layer_steps(layer)
+            for warning in step_warnings(step)
+            if "above the machine" in warning
+        ]
+        result = {
+            "changed": {
+                k: {"from": old[k], "to": v} for k, v in changes.items()
+            },
+            "machine": describe_machine(m),
+        }
+        if over:
+            result["steps_over_new_limits"] = over
+        return result
+
+    result = on_main(apply)
+    notify("AI assistant changed the machine settings (approved by operator)")
+    return result

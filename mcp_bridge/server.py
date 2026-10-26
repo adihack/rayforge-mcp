@@ -80,6 +80,12 @@ Engrave (raster) for fills. Speeds above the machine's maximum are refused.
 Before the first machine action on a machine, call machine_info and \
 tell the user about any "checks" it reports (e.g. GRBL laser mode off).
 
+Controller settings ($N on GRBL): change them with \
+set_controller_setting, which reads them back. Rayforge's own machine \
+profile (max speeds, acceleration, frame power/speed) is changed with \
+set_machine_settings. machine_send_command sends one console line; \
+read-only queries ($$, $#, $G, $I) need no approval, anything else does.
+
 Machine actions (home, jog, frame, start, resume, clear alarm) wait for \
 the operator to click Allow in Rayforge. If one is denied or times out, \
 do not retry it in a loop: tell the user. machine_stop never needs \
