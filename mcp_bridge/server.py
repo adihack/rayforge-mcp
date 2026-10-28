@@ -90,6 +90,10 @@ Machine actions (home, jog, frame, start, resume, clear alarm) wait for \
 the operator to click Allow in Rayforge. If one is denied or times out, \
 do not retry it in a loop: tell the user. machine_stop never needs \
 approval; use it if anything looks wrong.
+
+Some controllers stop reporting while they home and keep showing IDLE. \
+machine_status's awaiting_ok lists commands the controller has not \
+answered yet (e.g. "$H"); motion is refused until it is empty.
 """
 
 

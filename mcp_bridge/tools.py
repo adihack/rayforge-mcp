@@ -895,6 +895,24 @@ READY_STATES = ("IDLE", "UNKNOWN")
 HOME_STATES = READY_STATES + ("ALARM",)
 
 
+def awaiting_ok(m):
+    """
+    Commands the controller has not acknowledged yet (GRBL drivers).
+    Some controllers (the TwoTrees H40) stop answering status polls
+    while homing, so the last reported state stays IDLE; the unanswered
+    '$H' is then the only sign that homing is still running.
+    """
+    session = getattr(m.driver, "_session", None)
+    try:
+        return [str(c) for c in getattr(session, "pending_commands", ())]
+    except Exception:  # noqa: BLE001 - other drivers, older raydriver
+        return []
+
+
+def homing_unanswered(waiting):
+    return any(c.upper().startswith("$H") for c in waiting)
+
+
 def require_machine(connected=True, idle=True, states=READY_STATES):
     m = machine()
     if m is None:
@@ -915,6 +933,14 @@ def require_machine(connected=True, idle=True, states=READY_STATES):
         raise ToolError(
             f"The controller is busy ({status}). Wait until it is idle; "
             "check with machine_status."
+        )
+    waiting = awaiting_ok(m) if idle and connected else []
+    if waiting:
+        busy = "still homing" if homing_unanswered(waiting) else "busy"
+        raise ToolError(
+            f"The controller is {busy}: it has not answered "
+            f"{', '.join(waiting)} yet, although it may report IDLE. Wait "
+            "until machine_status shows awaiting_ok empty."
         )
     return m
 
@@ -2022,6 +2048,7 @@ def t_machine_status(args):
             "paused": bool(hold and hold.get_state().get_boolean()),
             "job_running": win.machine_cmd.is_job_running,
             "job": m.current_job,
+            "awaiting_ok": awaiting_ok(m),
         }
 
     return on_main(run)
@@ -2291,6 +2318,7 @@ def machine_snapshot(m):
         ),
         "error": m.device_state.error,
         "position": position_text(m),
+        "awaiting_ok": awaiting_ok(m),
     }
 
 
@@ -2362,42 +2390,49 @@ def t_machine_home(args):
     )
     result = on_main(lambda: machine_snapshot(m))
     gave_up = finished and "TimeoutError" in str(outcome.get("error"))
+
+    def homing(r):
+        # The state alone is not enough: a controller that stops
+        # reporting while homing still shows its old IDLE.
+        return r["status"] == "HOME" or homing_unanswered(r["awaiting_ok"])
+
     if gave_up:
         # Rayforge stops waiting after a fixed time (10 s in 1.13), which
         # is too short for large machines. Follow the controller instead.
         while (
-            result["status"] == "HOME"
+            homing(result)
             and result["connection"] == "CONNECTED"
             and time.monotonic() - started < timeout
         ):
             time.sleep(0.5)
             result = on_main(lambda: machine_snapshot(m))
-    if finished and result["status"] not in READY_STATES + ("HOME",):
+    if finished and not homing(result):
         # Rayforge sends a few setup commands after homing; give the
         # controller a moment to settle so the next action is not refused.
         settle = time.monotonic() + 3.0
         while (
             result["status"] not in READY_STATES + ("ALARM",)
-            and time.monotonic() < settle
-        ):
+            or result["awaiting_ok"]
+        ) and time.monotonic() < settle:
             time.sleep(0.25)
             result = on_main(lambda: machine_snapshot(m))
     result["seconds"] = rnd(time.monotonic() - started, 1)
     if gave_up and result["connection"] == "CONNECTED":
         result["rayforge_error"] = outcome["error"]
-        if result["status"] in READY_STATES:
+        if result["status"] in READY_STATES and not homing(result):
             result["homed"] = True
             result["note"] = (
                 "Rayforge stopped waiting for homing early, but the "
                 f"controller finished after {result['seconds']} s and is "
                 "idle."
             )
-        elif result["status"] == "HOME":
+        elif homing(result):
             result["homed"] = False
             result["note"] = (
                 "Rayforge stopped waiting for homing early and the "
                 f"controller is still homing after {result['seconds']} s. "
-                "Check machine_status until it is IDLE before the next move."
+                "Before the next move, check machine_status until it is "
+                "IDLE and awaiting_ok is empty."
             )
         else:
             result["homed"] = False
@@ -2474,7 +2509,8 @@ def t_machine_jog(args):
         f"Machine: {m.name}\nMove: {moves} at {speed} mm/min (laser off)\n"
         f"Current position: {where}",
     )
-    on_main(lambda: win.machine_cmd.jog(m, deltas, speed))
+    # The controller may have become busy while the dialog was open.
+    on_main(lambda: (require_machine(), win.machine_cmd.jog(m, deltas, speed)))
     return {"jogging": moves, "speed": speed}
 
 
@@ -2545,7 +2581,12 @@ def t_machine_start_job(args):
         f"Steps:\n{steps_text}{warn}"
         + (f"\n\n{end_move}" if end_move else ""),
     )
-    on_main(lambda: window_action("machine-send").activate(None))
+    on_main(
+        lambda: (
+            require_machine(),
+            window_action("machine-send").activate(None),
+        )
+    )
     notify("AI assistant started the job (approved by operator)")
     return {
         "submitted": True,

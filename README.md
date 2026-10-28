@@ -123,7 +123,10 @@ as `frame`. Placing a 60×40 mm design at x=20 puts the cut at x=20.
 - One approval at a time. `machine_stop`, `machine_pause` and
   `machine_status` never wait, even while a dialog is open.
 - Motion commands are refused while the controller is busy (homing,
-  running, jogging); homing is also allowed from ALARM.
+  running, jogging); homing is also allowed from ALARM. They are also
+  refused while the controller has not answered a command yet: some
+  controllers, such as the TwoTrees H40, stop reporting while they
+  home and keep showing IDLE until the end.
 - Console lines, controller settings and machine-profile changes also
   need Allow. The dialog shows the following:
   - for a console line: the exact line, and what it does (moves the
@@ -198,7 +201,10 @@ headless:
   takes 15 s to home, Rayforge gave up after 10 s, and `machine_home`
   followed the controller and reported success after 15.5 s. With a
   12 s limit it reported "still homing", and frame and jog were refused
-  until the controller was idle.
+  until the controller was idle. The same results held for a
+  controller that stops answering status polls while homing, as the
+  H40 does: frame, jog, start and console were all refused until it
+  answered `$H`.
 - **Console and settings tools (22 checks)** against the fake GRBL:
   - `$$` and `$G` ran without a dialog. A denied `G0` sent nothing.
   - An approved bad command came back as `error:3` with its meaning.
@@ -211,14 +217,17 @@ headless:
   - `set_machine_settings` changed max speeds and frame power/speed
     after Allow. Rayforge saved them in the machine file, and steps
     above the new limits were listed.
-- **Real hardware (0.3.1):** TwoTrees TTC-H40 (grblHAL, 20 W diode).
-  Tested `machine_info`, home, jog, frame, and a 10–100 % power-test
-  job.
+- **Real hardware:** TwoTrees TTC-H40 (grblHAL, 20 W diode).
+  - 0.3.1: `machine_info`, home, jog, frame, and a 10–100 % power-test
+    job.
+  - 0.4.0: opening a project, layer edits, `$$` through the console,
+    home, jog, frame, and three jobs run to the end, the longest about
+    1 h 20 min.
 - **Snap Rayforge 1.13.1** (strict confinement): installed with Install
   from URL and used for a design-only session from Claude Code.
 
-**Not tested yet:** Windows/macOS, Flatpak, raster-image imports; the
-0.4.0 changes on real hardware.
+**Not tested yet:** Windows/macOS, Flatpak, raster-image imports;
+`set_controller_setting` and `set_machine_settings` on real hardware.
 
 ## Changelog
 
@@ -243,8 +252,10 @@ headless:
     system, its offset, and where the head goes after a job.
   - `machine_home` waits until homing has finished and reports how it
     ended. If Rayforge stops waiting early (its limit is 10 s), the
-    tool keeps watching the controller.
-  - Motion commands are refused while the controller is busy.
+    tool keeps watching the controller until it answers `$H`.
+  - Motion commands are refused while the controller is busy, or
+    while it has not answered a command yet (`awaiting_ok` in
+    `machine_status`). The H40 keeps reporting IDLE while it homes.
   - New controller tools (each needs Allow):
     - `machine_send_command`: one console line with its reply;
       read-only queries need no approval
